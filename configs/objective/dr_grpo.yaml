@@ -1,0 +1,5 @@
+estimator: null
+trl:
+  loss_type: dr_grpo
+  scale_rewards: none
+  beta: 0.0

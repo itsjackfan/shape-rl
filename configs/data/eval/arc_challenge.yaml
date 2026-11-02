@@ -1,0 +1,4 @@
+# @package data.eval.arc_challenge
+task: arc_challenge_chat
+suite: reasoning
+metric: "exact_match,remove_whitespace"

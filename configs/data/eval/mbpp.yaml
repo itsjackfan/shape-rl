@@ -1,0 +1,4 @@
+# @package data.eval.mbpp
+task: mbpp_instruct
+suite: code
+metric: "pass_at_1,extract_code"

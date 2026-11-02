@@ -1,0 +1,7 @@
+estimator: null
+trl:
+  loss_type: dapo
+  scale_rewards: group
+  epsilon_high: 0.28
+  mask_truncated_completions: true
+  beta: 0.0

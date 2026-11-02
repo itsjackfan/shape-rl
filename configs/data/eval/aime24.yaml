@@ -1,0 +1,4 @@
+# @package data.eval.aime24
+task: aime24
+suite: math
+metric: "exact_match,none"

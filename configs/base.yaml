@@ -1,0 +1,17 @@
+exp: ${git_branch:}
+ablation: ???
+output_root: ${oc.env:SHAPE_RL_OUTPUT_ROOT,outputs}
+log_path: EXPERIMENT_LOG.md
+seed: 0
+wandb:
+  project: shape-rl
+  entity: null
+  mode: online
+
+hydra:
+  run:
+    dir: .
+  sweep:
+    dir: .
+    subdir: .
+  output_subdir: null

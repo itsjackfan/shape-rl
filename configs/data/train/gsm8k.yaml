@@ -1,0 +1,3 @@
+# @package data.train.gsm8k
+_target_: shape_rl.data.gsm8k
+split: train

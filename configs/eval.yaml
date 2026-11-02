@@ -1,0 +1,12 @@
+defaults:
+  - base
+  - model: qwen3.6-27b
+  - data/eval: [gsm8k, math500, aime24, humaneval, mbpp, gpqa_diamond, arc_challenge]
+  - _self_
+
+ckpt: null  # checkpoint dir name under the ablation's run dir (e.g. checkpoint-500); null = model.path as-is
+eval:
+  backend: hf  # hf | vllm
+  batch_size: auto
+  limit: null
+  gen_kwargs: null

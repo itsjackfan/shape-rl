@@ -1,0 +1,4 @@
+# @package data.eval.math500
+task: minerva_math500
+suite: math
+metric: "math_verify,none"

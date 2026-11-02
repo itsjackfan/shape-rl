@@ -1,0 +1,3 @@
+# @package data.train.math
+_target_: shape_rl.data.math
+split: train

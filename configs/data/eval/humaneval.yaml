@@ -1,0 +1,4 @@
+# @package data.eval.humaneval
+task: humaneval_instruct
+suite: code
+metric: "pass@1,create_test"

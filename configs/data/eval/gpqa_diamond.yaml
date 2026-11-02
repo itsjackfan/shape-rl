@@ -1,0 +1,4 @@
+# @package data.eval.gpqa_diamond
+task: gpqa_diamond_cot_zeroshot
+suite: reasoning
+metric: "exact_match,flexible-extract"

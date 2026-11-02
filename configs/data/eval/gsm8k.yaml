@@ -1,0 +1,4 @@
+# @package data.eval.gsm8k
+task: gsm8k_cot_zeroshot
+suite: math
+metric: "exact_match,flexible-extract"
