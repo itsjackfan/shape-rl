@@ -1,0 +1,9 @@
+defaults:
+  - base
+  - model: qwen3.5-4b
+  - data/train: [gsm8k, math]
+  - rollout: default
+  - _self_
+
+shard: 0  # this job's prompts: prompts[shard::num_shards]
+num_shards: 1

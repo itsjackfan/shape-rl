@@ -1,0 +1,1 @@
+batch_tokens: 65536  # padded tokens per forward pass

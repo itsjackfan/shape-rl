@@ -1,0 +1,18 @@
+# Counterfactual rollouts (shape_rl.rollout). Response cap: model.max_new_tokens.
+num_prompts: 1000      # seeded draw from the train pool, before the 0 < pass rate < 1 filter
+samples: 8             # traces per prompt for the pass-rate filter
+temperature: 1.0       # policy sampling (= train.temperature)
+max_correct: 2         # traces branched per prompt
+max_incorrect: 2
+n_entropy: 8           # branch points per trace from its top-20% entropy positions
+n_random: 8            # control branch points per trace, uniform over the rest
+entropy_quantile: 0.8
+top_logprobs: 20       # K: entropy estimate and alternatives a'
+n_alt: 2               # k next most likely tokens a'
+M: 8                   # continuations per (state, action)
+chunk_prompts: 8       # kept prompts per resumable chunk
+split: [70, 15, 15]    # train/val/test % by hashed prompt_id
+max_prompt_len: 1024
+gpu_memory_utilization: 0.85
+prefix_caching: true
+max_num_seqs: 512

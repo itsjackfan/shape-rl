@@ -1,0 +1,3 @@
+path: Qwen/Qwen3.5-4B
+chat_template_kwargs: {enable_thinking: false}  # Qwen3.5/3.6 templates open <think> unless this is false
+max_new_tokens: 4096  # response cap; set from the smoke so that <5% of traces truncate

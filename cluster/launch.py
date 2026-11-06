@@ -1,9 +1,11 @@
-"""SLURM launcher. Humans only, from the synced worktree on a login node:
-`uv run --env-file .env python cluster/launch.py train|eval <hydra overrides> [--gpus N] [--rtx] [--time D-HH:MM:SS]`"""
+"""SLURM launcher, from the synced worktree on a login node:
+`uv run --env-file .env python cluster/launch.py train|eval|rollout|encode|ssl <hydra overrides> [--gpus N] [--rtx] [--time D-HH:MM:SS]
+[--queues partition:account[:gpu],...] [--shards N]`"""
 import argparse
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from hydra import compose, initialize_config_dir
@@ -20,32 +22,46 @@ def queues(rtx):
     return qs + [("kempner_rtx", "kempner_ydu_lab", GPUS[-1])] if rtx else qs
 
 
-def best_queue(gpus, rtx, time="2-00:00:00"):
+def parse_queues(spec):
+    """'kempner_requeue:kempner_krajan_lab:nvidia_h200,...' -> [(partition, account, gpu)]; no gpu = every type in GPUS."""
+    out = []
+    for q in spec.split(","):
+        p, a, *g = q.split(":")
+        out += [(p, a, x) for x in (g or GPUS)]
+    return out
+
+
+def best_queue(gpus, rtx, time="2-00:00:00", qs=None):
     """(partition, account, gpu type) with the earliest `sbatch --test-only` start (ISO timestamps sort as strings)."""
     def start(partition, account, gpu):
         err = subprocess.run(["sbatch", "--test-only", f"--partition={partition}", f"--account={account}", f"--gres=gpu:{gpu}:{gpus}",
                               f"--time={time}", str(ROOT / "cluster/run.sbatch")], cwd=ROOT, capture_output=True, text=True).stderr
         m = re.search(r"to start at (\S+)", err)
         return m.group(1) if m else "9999"  # partition lacks this GPU type
-    return min(queues(rtx), key=lambda q: start(*q))
+    return min(qs or queues(rtx), key=lambda q: start(*q))
 
 
 def main(argv):
     parser = argparse.ArgumentParser()
-    parser.add_argument("entry", choices=["train", "eval"])
+    parser.add_argument("entry", choices=["train", "eval", "rollout", "encode", "ssl"])
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--rtx", action="store_true", help="also allow kempner_rtx (keep to a minimum)")
     parser.add_argument("--time", default="2-00:00:00")
+    parser.add_argument("--queues", default=None, help="partition:account[:gpu],... (default: QUEUES x GPUS)")
+    parser.add_argument("--shards", type=int, default=0, help="rollout/encode: submit N jobs with shard=i num_shards=N")
     args, overrides = parser.parse_known_args(argv)
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base=None):
         cfg = compose(args.entry, overrides=overrides)
     paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
     logs = Path(cfg.output_root) / cfg.exp / "slurm"
     logs.mkdir(parents=True, exist_ok=True)
-    partition, account, gpu = best_queue(args.gpus, args.rtx, args.time)
-    subprocess.run(["sbatch", f"--job-name={cfg.exp}/{cfg.ablation}", f"--output={logs}/{cfg.ablation}-{args.entry}-%j.out",
-                    f"--partition={partition}", f"--account={account}", f"--gres=gpu:{gpu}:{args.gpus}", f"--time={args.time}",
-                    str(ROOT / "cluster/run.sbatch"), args.entry, *overrides], cwd=ROOT, check=True)
+    qs = parse_queues(args.queues) if args.queues else None
+    for extra in ([[f"shard={i}", f"num_shards={args.shards}"] for i in range(args.shards)] or [[]]):
+        partition, account, gpu = best_queue(args.gpus, args.rtx, args.time, qs)
+        subprocess.run(["sbatch", f"--job-name={cfg.exp}/{cfg.ablation}", f"--output={logs}/{cfg.ablation}-{args.entry}-%j.out",
+                        f"--partition={partition}", f"--account={account}", f"--gres=gpu:{gpu}:{args.gpus}", f"--time={args.time}",
+                        str(ROOT / "cluster/run.sbatch"), args.entry, *overrides, *extra], cwd=ROOT, check=True)
+        time.sleep(1)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,9 @@
+# Encodes the rollout dataset of the same <exp>/<ablation> (shape_rl.encode).
+defaults:
+  - base
+  - model: qwen3.5-4b
+  - encode: default
+  - _self_
+
+shard: 0  # this job's rollout chunks: chunks[shard::num_shards]
+num_shards: 1

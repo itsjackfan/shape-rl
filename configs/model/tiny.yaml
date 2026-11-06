@@ -1,1 +1,3 @@
 path: trl-internal-testing/tiny-Qwen3_5MoeForConditionalGeneration-3.6
+chat_template_kwargs: {enable_thinking: false}
+max_new_tokens: 16

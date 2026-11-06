@@ -1,0 +1,9 @@
+# Trains and evaluates one estimator (configs/estimator/<name>.yaml) on one counterfactual dataset (shape_rl.ssl).
+defaults:
+  - base
+  - estimator: b2
+  - _self_
+
+ssl:
+  data: cf-data/full  # dataset dir <exp>/<ablation> under output_root (index.parquet + states/)
+  seeds: [0, 1, 2]
