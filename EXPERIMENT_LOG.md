@@ -21,3 +21,4 @@ Failed experiments: add an entry here on main with branch, code changes, and why
 - 2026-11-06 04:20 EST — smoke50: [agent] encode smoke on the smoke50 rollouts: last-layer states at branch points, throughput
 - 2026-11-06 04:20 EST — smoke50-ssl: [agent] ssl smoke: one estimator, one seed on the smoke50 dataset (pipeline check, not a result)
 - 2026-11-06 04:40 EST — full: [agent] counterfactual dataset (rollout + encode): all GSM8K+MATH train prompts x 8 samples, cap 16384, branch on prompts with 0 < pass rate < 1; 32 shards on kempner_requeue
+- 2026-11-06 05:09 EST — smoke-ck: [agent] smoke of the checkpointed vLLM engine loop (stage A + one branch chunk), 40 prompts, cap 2048, MIG slice

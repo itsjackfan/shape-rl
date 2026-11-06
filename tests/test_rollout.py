@@ -49,8 +49,11 @@ class FakeEngine:
     def __init__(self, tok):
         self.resp = [tok(f"so \\boxed{{{a}}}", add_special_tokens=False).input_ids + [tok.eos_token_id] for a in (2, 3)]
 
-    def sample(self, prompts, n, max_tokens, temperature):
-        return [[(self.resp[i % 2][:m], len(self.resp[i % 2]) <= m) for i in range(n)] for m in max_tokens]
+    def run(self, prompts, n, max_tokens, temperature, keys, on_done, save):
+        for k, m in zip(keys, max_tokens):
+            if k is not None:
+                on_done(k, [(self.resp[i % 2][:m], len(self.resp[i % 2]) <= m) for i in range(n)])
+        save()
 
     def topk(self, seqs, k):
         def top(a):
@@ -73,4 +76,12 @@ def test_rollout_smoke(cfg_factory, monkeypatch):
     assert set(rows.kind) <= {"entropy", "random"} and (rows.pos == rows.prompt_len + rows.t).all()
     assert all(len(a) == 3 for a in rows.actions) and all(len(v) == 2 for v in rows.v_out) and all(len(q) == 6 for q in rows.q_out)
     assert set(np.concatenate(list(rows.v_out) + list(rows.q_out))) <= {-1, 0, 1}
+    assert not list(out.glob("*.ckpt"))  # checkpoints are removed once their output exists
     rollout.run(cfg, engine=None)  # resume: every chunk exists, so no engine is built
+
+
+def test_checkpoint_resume(tmp_path):
+    ck = rollout.Checkpoint(tmp_path / "x.ckpt")
+    ck.setdefault("C", {})[3] = [(1, 10)]
+    ck.save()
+    assert rollout.Checkpoint(tmp_path / "x.ckpt") == {"C": {3: [(1, 10)]}}

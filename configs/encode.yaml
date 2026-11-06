@@ -5,5 +5,5 @@ defaults:
   - encode: default
   - _self_
 
-shard: 0  # this job's rollout chunks: crc32(chunk name) % num_shards == shard
+shard: 0  # unused: jobs share chunks through claim files (launch.py --shards N submits N jobs)
 num_shards: 1
