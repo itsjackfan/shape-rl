@@ -37,3 +37,18 @@ def test_check_logged(tmp_path):
         paths.check_logged(log, "other", "abl2")
     with pytest.raises(RuntimeError):
         paths.check_logged(log, "nonexistent", "abl")
+
+
+def test_exp_name_from_gitinfo(tmp_path, monkeypatch):
+    (tmp_path / ".gitinfo").write_text("geo-adv abc123\n")
+    monkeypatch.setattr(paths, "ROOT", tmp_path)
+    assert paths.exp_name() == "geo-adv"
+
+
+def test_job_dir_resumes_on_requeue(tmp_path, monkeypatch):
+    d = paths.job_dir(tmp_path / "abl")
+    assert d.is_dir()
+    with pytest.raises(FileExistsError):
+        paths.job_dir(d)
+    monkeypatch.setenv("SLURM_RESTART_COUNT", "1")
+    assert paths.job_dir(d) == d

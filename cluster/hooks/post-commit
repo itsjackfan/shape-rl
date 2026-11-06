@@ -1,0 +1,10 @@
+#!/bin/bash
+# Mirror this worktree to FASRC holylabs after every commit. Needs an open `ssh fasrc` ControlMaster connection
+# (BatchMode fails fast instead of prompting for 2FA). Enable once per clone: git config core.hooksPath cluster/hooks
+b=$(git rev-parse --abbrev-ref HEAD)
+dst=/n/holylabs/ydu_lab/Lab/jfan425/shape-rl/$b
+printf '%s %s\n' "$b" "$(git rev-parse HEAD)" > .gitinfo
+# leading / anchors to repo root; excluded paths are also protected from --delete (cluster .env, .venv, outputs)
+rsync -az --delete --exclude /.git --exclude /.venv --exclude /.env --exclude /outputs --exclude /wandb \
+  --exclude __pycache__ --exclude .pytest_cache -e "ssh -o BatchMode=yes" --rsync-path="mkdir -p $dst && rsync" ./ "fasrc:$dst/" \
+  || echo "post-commit: sync failed; run 'ssh fasrc' once, then 'cluster/hooks/post-commit'"

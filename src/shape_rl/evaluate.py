@@ -14,10 +14,10 @@ def eval_dir(cfg):
 def run(cfg):
     """Evaluate model.path (or <run_dir>/<ckpt>) with lm-eval; logs test/* into the ablation's WandB run."""
     paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
-    out = paths.fresh_dir(eval_dir(cfg))
+    out = paths.job_dir(eval_dir(cfg))
     pretrained = paths.run_dir(cfg) / cfg.ckpt if cfg.ckpt else cfg.model.path
     benches = cfg.data.eval
-    res = lm_eval.simple_evaluate(model=cfg.eval.backend, model_args=f"pretrained={pretrained},dtype=bfloat16",
+    res = lm_eval.simple_evaluate(model=cfg.eval.backend, model_args=f"pretrained={pretrained},{cfg.eval.model_args}",
                                   tasks=sorted({b.task for b in benches.values()}), batch_size=cfg.eval.batch_size,
                                   limit=cfg.eval.limit, gen_kwargs=cfg.eval.gen_kwargs, apply_chat_template=True,
                                   confirm_run_unsafe_code=True, random_seed=cfg.seed)

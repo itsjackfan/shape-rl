@@ -4,3 +4,5 @@ __pycache__/
 outputs/
 wandb/
 .pytest_cache/
+.env
+.gitinfo

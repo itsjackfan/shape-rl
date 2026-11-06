@@ -7,6 +7,7 @@ defaults:
 ckpt: null  # checkpoint dir name under the ablation's run dir (e.g. checkpoint-500); null = model.path as-is
 eval:
   backend: hf  # hf | vllm
+  model_args: dtype=bfloat16  # lm-eval model_args after pretrained=
   batch_size: auto
   limit: null
   gen_kwargs: null

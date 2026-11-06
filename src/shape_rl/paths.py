@@ -1,10 +1,16 @@
+import os
 import subprocess
 from pathlib import Path
 
 from omegaconf import OmegaConf
 
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
 def exp_name() -> str:
+    if (ROOT / ".gitinfo").exists() and not (ROOT / ".git").exists():  # cluster copy synced by cluster/hooks/post-commit
+        return (ROOT / ".gitinfo").read_text().split()[0]
     return subprocess.check_output(["git", "symbolic-ref", "--short", "HEAD"], text=True).strip().replace("/", "-")
 
 
@@ -21,6 +27,13 @@ def fresh_dir(path) -> Path:
         raise FileExistsError(f"{path} exists; outputs are never overwritten. Pick a new ablation name.")
     path.mkdir(parents=True)
     return path
+
+
+def job_dir(path) -> Path:
+    """fresh_dir, except a requeued SLURM job reuses its own dir and resumes."""
+    if int(os.environ.get("SLURM_RESTART_COUNT", 0)) > 0:
+        return Path(path)
+    return fresh_dir(path)
 
 
 def check_logged(log_path, exp: str, ablation: str):

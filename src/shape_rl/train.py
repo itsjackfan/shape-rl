@@ -2,6 +2,7 @@ import hydra
 from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig
 
 from shape_rl import data, paths
@@ -14,7 +15,7 @@ def run(cfg):
     paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
     out, state = paths.run_dir(cfg), PartialState()
     if state.is_main_process:
-        paths.fresh_dir(out)
+        paths.job_dir(out)
         OmegaConf.save(cfg, out / "config.yaml", resolve=True)
     state.wait_for_everyone()
 
@@ -25,7 +26,7 @@ def run(cfg):
     logger = WandbLogger(cfg, out) if state.is_main_process else None
     if logger:
         trainer.add_callback(logger)
-    trainer.train()
+    trainer.train(resume_from_checkpoint=get_last_checkpoint(str(out)))  # non-None only after a requeue
     if logger:
         logger.finish()
     return trainer
