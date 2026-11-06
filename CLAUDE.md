@@ -14,6 +14,7 @@ configs/              Hydra. train.yaml, eval.yaml share base.yaml
   lm_eval/            local lm-eval tasks (math500: minerva_math500 without its antlr4 4.11 check)
   data/train/         one yaml per train set (_target_ loader); enable via data/train=[a,b]
   data/eval/          one yaml per benchmark: lm-eval task, suite, primary metric
+  rollout/, estimator/  offline dataset settings; one yaml per offline estimator (B0-B3, C0-C3; _head.yaml shared)
 src/shape_rl/
   paths.py            exp = git branch; run dir; never-overwrite; run guard
   tracking.py         the only WandB interface; fixed metric namespaces
@@ -22,7 +23,11 @@ src/shape_rl/
   advantage.py        AdvantageEstimator base (observe hidden states, forward -> (n,) or (n, T)); one subclass per ablation
   trainer.py          ShapeTrainer(GRPOTrainer): estimator + hidden-state hook, DAPO dynamic sampling, FLOP count/budget, per-suite metrics
   flops.py            model FLOPs of the training process (the compute-matching axis)
-  train.py, evaluate.py  Hydra entrypoints
+  train.py, evaluate.py  Hydra entrypoints (RL, lm-eval)
+  offline estimator study (Hydra entrypoints rollout, encode, ssl):
+  rollout.py          counterfactual rollouts (vLLM): traces -> branch points -> MC labels of V(s_t), Q(s_t, a)
+  hidden.py, encode.py  last-layer states at the branch points
+  ssl.py              offline estimators (heads exported for RL); contrastive.py C0-C3 projections; ssl_metrics.py metrics, ceilings
 cluster/              launch.py (log gate, queue choice, sbatch), run.sbatch, zero3.yaml, setup.sh, hooks/post-commit
 tests/                shape + smoke tests (mocked hub/lm-eval; `-m slow` runs a tiny real GRPO step)
 scripts/tmp_<exp>/    one-off scripts; delete once results are documented (ask first)
@@ -33,7 +38,7 @@ scripts/tmp_<exp>/    one-off scripts; delete once results are documented (ask f
 - Tensor dims: Shazeer suffixes (`rewards_N`, `x_BLD`) with a one-docstring legend at the top of each file. Prefer einsum/einops.
 - Hot-swap by config, not flags: new estimator = subclass in `advantage.py` + `configs/objective/<name>.yaml`; new train set = function in `data.py` + `configs/data/train/<name>.yaml`; new benchmark = `configs/data/eval/<name>.yaml`; new model = `configs/model/<name>.yaml`.
 - All metrics go through `tracking.py`. Namespaces: `train/*`, `test/*`, `optim/*`, `progress/*`, `perf/*`, `policy/*` (ablation-specific). Don't invent new top-level namespaces.
-- Tests: shape + smoke only. `uv run pytest -m "not slow"` before handing over any change; `uv run pytest` for trainer changes.
+- Tests: shape + smoke, plus exhaustive/property checks of pure functions (`tests/test_properties.py`). `uv run pytest -m "not slow"` before handing over any change; `uv run pytest` for trainer changes.
 
 ## Experiments
 `<exp>` = short descriptive name of the hypothesis. One change per ablation.
