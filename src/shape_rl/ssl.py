@@ -232,7 +232,13 @@ def residual(x, Z):
 
 def partial_corr(x, y, Z, groups):
     """Correlation of x and y after removing per-group means (prompt fixed effects) and then a linear fit on Z from both."""
-    d = pd.DataFrame(np.c_[x, y, Z]).groupby(groups).transform(lambda c: c - c.mean()).values
+    if len(x) < 3:
+        return float("nan")
+    code = pd.factorize(groups)[0]
+    D = np.c_[x, y, Z].astype(float)
+    mean = np.zeros((code.max() + 1, D.shape[1]))
+    np.add.at(mean, code, D)
+    d = D - (mean / np.bincount(code)[:, None])[code]
     r = d[:, :2] - d[:, 2:] @ np.linalg.lstsq(d[:, 2:], d[:, :2], rcond=None)[0] if Z.shape[1] else d[:, :2]
     return float(np.corrcoef(r[:, 0], r[:, 1])[0, 1]) if r[:, 0].std() > 1e-12 else float("nan")
 
