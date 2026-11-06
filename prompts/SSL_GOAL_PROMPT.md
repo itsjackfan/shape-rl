@@ -20,9 +20,9 @@ The repo is infrastructure only: a TRL 1.17.1 `GRPOTrainer` subclass with a swap
 
 ## Where you run
 A FASRC login node: shared and CPU-only. Do only git, tests, SLURM commands and light analysis there; anything heavier (rollouts, hidden-state extraction, SSL training, analysis of large files, GPU tests) runs as a SLURM job.
-- Work only in your own git clone of `itsjackfan/shape-rl` (the directory you were started in) and worktrees beside it. Keep `core.hooksPath` unset there.
+- Work only in your own git clone of `itsjackfan/shape-rl` (the directory you were started in), on branch `ssl-goal`: branch your worktrees from `ssl-goal` and merge finished work back into it, never into `main`. Keep `core.hooksPath` unset.
 - Never touch `/n/holylabs/ydu_lab/Lab/jfan425/shape-rl/<branch>/`: those are rsync mirrors of Jack's commits, overwritten with `--delete` on every sync.
-- Each worktree needs the `.env` from your clone's root (copy it; never commit or print it) and `bash cluster/setup.sh` (synced environment plus model weights).
+- Each worktree needs the `.env` from your clone's root (copy it; never commit or print it) and `uv sync --extra cluster`. Download only the models you use (`uv run --env-file .env hf download <model>`); don't run `cluster/setup.sh`, which also pulls the 27B and 35B weights. If `.env` has no WandB key, run with `wandb.mode=offline`.
 - Results are under `$SHAPE_RL_OUTPUT_ROOT/<exp>/`, SLURM logs under its `slurm/`.
 
 ## Research context
@@ -86,4 +86,4 @@ In chat, numbers only; the user writes the interpretation:
 5. Three lines proposing the next goal: the best estimator as `configs/objective/<name>.yaml`, producing token-level advantages from the hidden states of the existing forward pass, compared with GRPO / Dr. GRPO / DAPO at matched compute.
 
 ## Protocol for every step
-1. Worktree and branch per `CLAUDE.md`. 2. Tests first, then code; `uv run pytest -m "not slow"` (in a GPU job when you need it fully green). 3. Register the run, then launch it. 4. Analyse with scripts in `scripts/tmp_<exp>/`, report, and take the next step. 5. Merge working branches into main in your clone; never push or delete outputs without approval.
+1. Worktree and branch per `CLAUDE.md`. 2. Tests first, then code; `uv run pytest -m "not slow"` (in a GPU job when you need it fully green). 3. Register the run, then launch it. 4. Analyse with scripts in `scripts/tmp_<exp>/`, report, and take the next step. 5. Merge working branches into `ssl-goal` in your clone; never push or delete outputs without approval.
