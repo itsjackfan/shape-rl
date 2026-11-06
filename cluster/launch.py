@@ -36,11 +36,11 @@ def gres(gpu, gpus):
     return [f"--gres=gpu:{gpu}:{gpus}"] if gpus else ["--cpus-per-task=16", "--mem=128G"]
 
 
-def best_queue(gpus, rtx, time="2-00:00:00", qs=None):
+def best_queue(gpus, rtx, time="2-00:00:00", qs=None, extra=()):
     """(partition, account, gpu type) with the earliest `sbatch --test-only` start (ISO timestamps sort as strings)."""
     def start(partition, account, gpu):
         err = subprocess.run(["sbatch", "--test-only", f"--partition={partition}", f"--account={account}", *gres(gpu, gpus),
-                              f"--time={time}", str(ROOT / "cluster/run.sbatch")], cwd=ROOT, capture_output=True, text=True).stderr
+                              f"--time={time}", *extra, str(ROOT / "cluster/run.sbatch")], cwd=ROOT, capture_output=True, text=True).stderr
         m = re.search(r"to start at (\S+)", err)
         return m.group(1) if m else "9999"  # partition lacks this GPU type
     return min(qs or queues(rtx), key=lambda q: start(*q))
@@ -54,6 +54,7 @@ def main(argv):
     parser.add_argument("--time", default="2-00:00:00")
     parser.add_argument("--queues", default=None, help="partition:account[:gpu],... (default: QUEUES x GPUS)")
     parser.add_argument("--shards", type=int, default=0, help="rollout/encode: submit N jobs with shard=i num_shards=N")
+    parser.add_argument("--sbatch", default="", help="extra sbatch flags, e.g. '--cpus-per-gpu=8 --mem-per-gpu=64G'")
     args, overrides = parser.parse_known_args(argv)
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base=None):
         cfg = compose(args.entry, overrides=overrides)
@@ -62,9 +63,9 @@ def main(argv):
     logs.mkdir(parents=True, exist_ok=True)
     qs = parse_queues(args.queues) if args.queues else None
     for extra in ([[f"shard={i}", f"num_shards={args.shards}"] for i in range(args.shards)] or [[]]):
-        partition, account, gpu = best_queue(args.gpus, args.rtx, args.time, qs)
+        partition, account, gpu = best_queue(args.gpus, args.rtx, args.time, qs, args.sbatch.split())
         subprocess.run(["sbatch", f"--job-name={cfg.exp}/{cfg.ablation}", f"--output={logs}/{cfg.ablation}-{args.entry}-%j.out",
-                        f"--partition={partition}", f"--account={account}", *gres(gpu, args.gpus), f"--time={args.time}",
+                        f"--partition={partition}", f"--account={account}", *gres(gpu, args.gpus), f"--time={args.time}", *args.sbatch.split(),
                         str(ROOT / "cluster/run.sbatch"), args.entry, *overrides, *extra], cwd=ROOT, check=True)
         time.sleep(1)
 
