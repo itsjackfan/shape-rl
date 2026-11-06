@@ -57,3 +57,14 @@ def test_job_dir_resumes_on_requeue(tmp_path, monkeypatch):
 def test_job_dir_requeue_before_first_start(tmp_path, monkeypatch):
     monkeypatch.setenv("SLURM_RESTART_COUNT", "2")
     assert paths.job_dir(tmp_path / "abl").is_dir()
+
+
+def test_last_complete_checkpoint(tmp_path):
+    from shape_rl.trainer import STATE_FILE, last_complete_checkpoint
+
+    assert last_complete_checkpoint(tmp_path) is None
+    for step, complete in ((5, True), (10, True), (20, False)):  # 20: preempted while saving
+        (tmp_path / f"checkpoint-{step}").mkdir()
+        if complete:
+            (tmp_path / f"checkpoint-{step}" / STATE_FILE).touch()
+    assert last_complete_checkpoint(tmp_path) == str(tmp_path / "checkpoint-10")

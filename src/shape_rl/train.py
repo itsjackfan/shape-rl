@@ -3,12 +3,11 @@ from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
-from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig
 
 from shape_rl import data, paths
 from shape_rl.tracking import WandbLogger
-from shape_rl.trainer import ShapeTrainer
+from shape_rl.trainer import ShapeTrainer, last_complete_checkpoint
 
 
 def grpo_kwargs(cfg) -> dict:
@@ -20,11 +19,9 @@ def grpo_kwargs(cfg) -> dict:
 
 def train_dataset(cfg):
     """Train prompts whose chat-templated length is <= max_prompt_len tokens (the rule of rollout.py)."""
-    tok, kw = AutoTokenizer.from_pretrained(cfg.model.path), OmegaConf.to_container(cfg.model.chat_template_kwargs)
-    ds = data.load_train(cfg.data.train)
-    n_tok = lambda m: len(tok(tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True, **kw),
-                              add_special_tokens=False).input_ids)
-    return ds.filter(lambda x: n_tok(x["prompt"]) <= cfg.max_prompt_len)
+    tok = AutoTokenizer.from_pretrained(cfg.model.path)
+    fits = lambda x: len(data.chat_prompt_ids(tok, x["prompt"], cfg.model.chat_template_kwargs)) <= cfg.max_prompt_len
+    return data.load_train(cfg.data.train).filter(fits)
 
 
 def run(cfg):
@@ -43,7 +40,7 @@ def run(cfg):
     logger = WandbLogger(cfg, out) if state.is_main_process else None
     if logger:
         trainer.add_callback(logger)
-    trainer.train(resume_from_checkpoint=get_last_checkpoint(str(out)))  # non-None only after a requeue
+    trainer.train(resume_from_checkpoint=last_complete_checkpoint(out))  # non-None only after a requeue
     if logger:
         logger.finish()
     return trainer

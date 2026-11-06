@@ -6,6 +6,7 @@ G = generations per prompt, F = reward functions, P = padded prompt width, T = c
 """
 import json
 import os
+from pathlib import Path
 
 import torch
 from accelerate.utils import gather_object
@@ -17,8 +18,24 @@ from trl.models.utils import disable_gradient_checkpointing
 from shape_rl.flops import FlopModel
 from shape_rl.hidden import final_norm
 
-PROMPT_KEYS = {"prompt_ids": "pad", "prompt_mask": 0}  # left-padded per generation round
-ROW_KEYS = {"advantages"}  # one value per row
+STATE_FILE = "shape_state.pt"  # FLOP count + estimator state; written after the rest of a checkpoint
+PROMPT_KEYS = ("prompt_ids", "prompt_mask")  # left-padded per generation round; other per-token keys are right-padded
+
+
+def select_groups(keep_RG) -> list[tuple[int, int]]:
+    """DAPO batch of G-row groups from R generation rounds (keep_RG[r][g]: group g of round r has unequal correctness):
+    the kept groups in round order, then the degenerate groups in round order, cut to the groups of one round.
+    -> [(round, group)]."""
+    kept = [(r, g) for r, k in enumerate(keep_RG) for g in range(len(k)) if k[g]]
+    rest = [(r, g) for r, k in enumerate(keep_RG) for g in range(len(k)) if not k[g]]
+    return (kept + rest)[:len(keep_RG[0])]
+
+
+def last_complete_checkpoint(out) -> str | None:
+    """The newest checkpoint-<step> dir that has STATE_FILE, or None. A job preempted while it saved leaves a checkpoint
+    without it; a requeue resumes from the one before."""
+    done = [d for d in Path(out).glob(f"{PREFIX_CHECKPOINT_DIR}-*") if (d / STATE_FILE).exists()]
+    return str(max(done, key=lambda d: int(d.name.split("-")[-1]))) if done else None
 
 
 class FlopBudget(TrainerCallback):
@@ -38,6 +55,11 @@ class FlopBudget(TrainerCallback):
 
 
 class ShapeTrainer(GRPOTrainer):
+    """State passed between TRL's methods within one generation round (TRL calls them in this order):
+    _scoring (True during _score_round: scoring forwards are counted, not training forwards), _n_scoring (their number),
+    _capture (estimator.observe results of each sub-batch, or None), _rewards_NF and _gen_lengths_n (from _calculate_rewards).
+    Totals that a checkpoint keeps: flops_total, flops_saved_mark."""
+
     def __init__(self, *args, estimator=None, dynamic_sampling=None, budget=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.estimator, self.dynamic_sampling = estimator, dynamic_sampling
@@ -46,17 +68,15 @@ class ShapeTrainer(GRPOTrainer):
             estimator.gather = self.accelerator.gather
         self.flop_model = FlopModel(self.accelerator.unwrap_model(self.model).config._name_or_path)
         self.flops_total, self.flops_saved_mark, self._flops_local = 0.0, 0, 0.0
-        self._capture, self._scoring = None, False
+        self._capture, self._scoring, self._n_scoring = None, False, 0
         budget = budget or {}
         self.add_callback(FlopBudget(self, budget.get("max_flops"), budget.get("save_every_flops")))
 
     # ---- FLOPs: scoring forwards (old logps, reference) are counted where they run; generation and training per batch
 
     def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, **kw):
-        if not self._scoring:  # the training forward: counted in _count_batch
-            return super()._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, batch_size, **kw)
-        self._n_scoring += 1
-        if self._capture is None or model is not self.model:
+        self._n_scoring += self._scoring  # training forwards are counted in _count_batch
+        if not self._scoring or self._capture is None or model is not self.model:
             return super()._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, batch_size, **kw)
         # hidden-state capture: each sub-batch forward hits the hook once, rows in order
         P, rows = input_ids.shape[1] - logits_to_keep, [0]
@@ -118,33 +138,11 @@ class ShapeTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs):
         mode = "train" if self.model.training else "eval"
         out, rewards_N, correct_N = self._score_round(inputs)
-        suites = gather_object([x["suite"] for x in inputs])  # scores of the sampled prompts (before any filter)
-        self._metrics[mode]["mean_score"].append(correct_N.nanmean().item())
-        for s in set(suites):
-            self._metrics[mode][f"{s}/mean_score"].append(correct_N[[x == s for x in suites]].nanmean().item())
+        self._log_scores(mode, inputs, correct_N)  # the sampled prompts, before any filter
         if self.dynamic_sampling and mode == "train":
             out, correct_N = self._dynamic_sample(inputs, out, rewards_N, correct_N)
-
         if self.estimator is not None:
-            G = self.num_generations if mode == "train" else self.num_generations_eval
-            n = len(out["advantages"])
-            local = slice(self.accelerator.process_index * n, (self.accelerator.process_index + 1) * n)
-            obs = {k: torch.cat([c[k] for c in self._capture]) for k in self._capture[0]} if self._capture else {}
-            self.estimator.train(mode == "train")  # the online head fits on training batches only
-            adv = self.estimator(rewards_N, G, local, obs)
-            assert adv.shape[0] == n and (adv.dim() == 1 or adv.shape[1] == out["completion_ids"].shape[1]), adv.shape
-            out["advantages"] = adv
-            self._capture = None
-            # the completions table shows the advantages used (TRL logged its own): per-row mean over real tokens
-            m = out["completion_mask"].float()
-            row = adv if adv.dim() == 1 else (adv * m).sum(1) / m.sum(1).clamp(min=1)
-            log = self._logs["advantages"]  # a deque (maxlen = generation batch): drop TRL's N values, add the used ones
-            for _ in range(min(len(rewards_N), len(log))):
-                log.pop()
-            log.extend(self.accelerator.gather(row).tolist())
-            for k, v in self.estimator.metrics.items():
-                self._metrics[mode][f"estimator/{k}"].append(
-                    self.accelerator.gather(torch.tensor([float(v)], device=self.accelerator.device)).mean().item())
+            out["advantages"] = self._estimate(mode, out, rewards_N)
         if mode == "train":
             self._count_batch(out)
             self._metrics[mode]["flops"] = [self.flops_total]
@@ -153,6 +151,34 @@ class ShapeTrainer(GRPOTrainer):
             if self.estimator is not None:
                 self.estimator.flops = 0.0
         return out
+
+    def _log_scores(self, mode, inputs, correct_N):
+        suites = gather_object([x["suite"] for x in inputs])
+        self._metrics[mode]["mean_score"].append(correct_N.nanmean().item())
+        for s in set(suites):
+            self._metrics[mode][f"{s}/mean_score"].append(correct_N[[x == s for x in suites]].nanmean().item())
+
+    def _estimate(self, mode, out, rewards_N):
+        """The estimator's advantages for this process's rows (n,) or (n, T); also logs them and its metrics."""
+        G = self.num_generations if mode == "train" else self.num_generations_eval
+        n, p = len(out["advantages"]), self.accelerator.process_index
+        obs = {k: torch.cat([c[k] for c in self._capture]) for k in self._capture[0]} if self._capture else {}
+        self._capture = None
+        self.estimator.train(mode == "train")  # the online head fits on training batches only
+        adv = self.estimator(rewards_N, G, slice(p * n, (p + 1) * n), obs)
+        assert adv.shape[0] == n and (adv.dim() == 1 or adv.shape[1] == out["completion_ids"].shape[1]), adv.shape
+        # completions table: replace TRL's logged advantages (a deque, maxlen = generation batch) by the used ones,
+        # one value per row (the mean over its real tokens)
+        m = out["completion_mask"].float()
+        row = adv if adv.dim() == 1 else (adv * m).sum(1) / m.sum(1).clamp(min=1)
+        log = self._logs["advantages"]
+        for _ in range(min(len(rewards_N), len(log))):
+            log.pop()
+        log.extend(self.accelerator.gather(row).tolist())
+        for k, v in self.estimator.metrics.items():
+            self._metrics[mode][f"estimator/{k}"].append(
+                self.accelerator.gather(torch.tensor([float(v)], device=self.accelerator.device)).mean().item())
+        return adv
 
     # ---- DAPO dynamic sampling
 
@@ -171,31 +197,21 @@ class ShapeTrainer(GRPOTrainer):
         groups if too few were kept. Rows move between processes through a gather of every round."""
         G = self.num_generations
         n_groups = len(rewards_N) // G
-        rounds = [(out, correct_N)]
-
-        def kept(c):
-            c = c.view(-1, G)
-            return ~torch.isclose(c.max(1).values, c.min(1).values)
-
-        while sum(int(kept(c).sum()) for _, c in rounds) < n_groups and len(rounds) < self.dynamic_sampling["max_rounds"]:
+        kept = lambda c: (~torch.isclose(c.view(-1, G).max(1).values, c.view(-1, G).min(1).values)).tolist()
+        rounds, keep_RG = [(out, correct_N)], [kept(correct_N)]
+        while sum(map(sum, keep_RG)) < n_groups and len(rounds) < self.dynamic_sampling["max_rounds"]:
             o, _, c = self._score_round(self._fresh_inputs(inputs, len(rounds)))
             rounds.append((o, c))
-        pick = [(r, g) for r, (_, c) in enumerate(rounds) for g in kept(c).nonzero()[:, 0].tolist()]
-        pick += [(r, g) for r, (_, c) in enumerate(rounds) for g in (~kept(c)).nonzero()[:, 0].tolist()]
-        pick = pick[:n_groups]
+            keep_RG.append(kept(c))
+        pick = select_groups(keep_RG)
         rows = [(r, g * G + j) for r, g in pick for j in range(G)]
         full = self._gather_rounds([o for o, _ in rounds])
         n, p = len(out["advantages"]), self.accelerator.process_index
         mine = rows[p * n:(p + 1) * n]
-        new = {}
-        for k, v in full[0].items():
-            if not torch.is_tensor(v) or v.dim() == 0:
-                continue
-            new[k] = torch.stack([full[r][k][i] for r, i in mine])
+        new = {k: torch.stack([full[r][k][i] for r, i in mine]) for k in full[0]}
         new["num_items_in_batch"] = self.accelerator.gather(new["completion_mask"].sum()).sum()
         self._metrics["train"]["dynamic_sampling/rounds"].append(float(len(rounds)))
-        self._metrics["train"]["dynamic_sampling/kept_frac"].append(
-            sum(1 for r, g in pick if kept(rounds[r][1])[g]) / n_groups)
+        self._metrics["train"]["dynamic_sampling/kept_frac"].append(sum(keep_RG[r][g] for r, g in pick) / n_groups)
         correct = torch.stack([rounds[r][1][i] for r, i in rows])
         return new, correct
 
@@ -214,11 +230,10 @@ class ShapeTrainer(GRPOTrainer):
             for k, v in o.items():
                 if not torch.is_tensor(v) or v.dim() == 0:
                     continue
+                fill = pad_id if k.endswith("_ids") else 0
                 if k in PROMPT_KEYS:
-                    fill = pad_id if PROMPT_KEYS[k] == "pad" else 0
                     v = torch.nn.functional.pad(v, (P - v.shape[1], 0), value=fill)
-                elif k not in ROW_KEYS and v.dim() >= 2 and v.shape[1] == o["completion_ids"].shape[1] and v.shape[1] > 1:
-                    fill = pad_id if k == "completion_ids" else 0
+                elif k != "advantages" and v.dim() >= 2 and v.shape[1] == o["completion_ids"].shape[1] and v.shape[1] > 1:
                     v = torch.nn.functional.pad(v, (0, 0) * (v.dim() - 2) + (0, T - v.shape[1]), value=fill)
                 g[k] = self.accelerator.gather(v.contiguous())
             res.append(g)
@@ -232,18 +247,16 @@ class ShapeTrainer(GRPOTrainer):
             d = os.path.join(self._get_output_dir(trial=trial), f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}")
             state = {"flops_total": self.flops_total, "flops_saved_mark": self.flops_saved_mark,
                      "estimator": None if self.estimator is None else self.estimator.extra_state()}
-            torch.save(state, os.path.join(d, "shape_state.pt"))
             with open(os.path.join(d, "flops.json"), "w") as f:
                 json.dump({"flops": self.flops_total, "num_tokens": self.state.num_input_tokens_seen,
                            "step": self.state.global_step}, f)
+            torch.save(state, os.path.join(d, f"{STATE_FILE}.tmp"))
+            os.replace(os.path.join(d, f"{STATE_FILE}.tmp"), os.path.join(d, STATE_FILE))  # last and atomic: marks it complete
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         super()._load_optimizer_and_scheduler(checkpoint)
-        if checkpoint is not None:
-            f = os.path.join(checkpoint, "shape_state.pt")
-            if not os.path.exists(f):  # preempted between the model save and this file: do not restart the count at 0
-                raise FileNotFoundError(f"{f} is missing; resume from an earlier checkpoint (delete {checkpoint} after review).")
-            state = torch.load(f, map_location="cpu", weights_only=False)
+        if checkpoint is not None:  # train.run resumes only from a complete checkpoint (last_complete_checkpoint)
+            state = torch.load(os.path.join(checkpoint, STATE_FILE), map_location="cpu", weights_only=False)
             self.flops_total, self.flops_saved_mark = state["flops_total"], state["flops_saved_mark"]
             if self.estimator is not None and state["estimator"] is not None:
                 self.estimator.load_extra_state(state["estimator"])
