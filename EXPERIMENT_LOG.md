@@ -32,3 +32,4 @@ Failed experiments: add an entry here on main with branch, code changes, and why
 - 2026-11-06 04:48 EST — c1: [agent] C1: supervised contrastive projection (same prompt, same success-rate bucket), linear readout; dataset cf-data/full, 3 seeds
 - 2026-11-06 04:48 EST — c2: [agent] C2: counterfactual-pair contrastive projection (|dQ| <= 0.25 positives, > 0.25 hard negatives), linear readout; dataset cf-data/full, 3 seeds
 - 2026-11-06 04:48 EST — c3: [agent] C3: k-means (64 clusters) on the best contrastive z, cluster-mean value; dataset cf-data/full, 3 seeds
+- 2026-11-06 06:01 EST — ssl-smoke: [agent] ssl launcher smoke on CPU (--gpus 0): b2, one seed, on the 9-chunk preliminary index of cf-data/full (pipeline check, not a result)
