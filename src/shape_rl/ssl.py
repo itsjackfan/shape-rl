@@ -60,6 +60,8 @@ def mlp(d_in, d_hid, d_out):
 def fit_head(x_tr, y_tr, w_tr, x_va, y_va, w_va, E, hidden):
     """Weighted BCE on soft labels; linear if hidden == 0 else 1-hidden-layer MLP; early stop on val loss. E = estimator.head."""
     net = (nn.Linear(x_tr.shape[1], 1) if hidden == 0 else mlp(x_tr.shape[1], hidden, 1)).to(DEV)
+    with torch.no_grad():  # start at the train base rate
+        (net if hidden == 0 else net[-1]).bias.fill_(torch.logit(((y_tr * w_tr).sum() / w_tr.sum()).clamp(1e-3, 1 - 1e-3)).item())
     opt = torch.optim.AdamW(net.parameters(), lr=E.lr, weight_decay=E.weight_decay)
     loss = lambda x, y, w: (F.binary_cross_entropy_with_logits(net(x)[:, 0], y, reduction="none") * w).sum() / w.sum()
     best, state, bad = float("inf"), None, 0
@@ -115,7 +117,8 @@ def supcon(z, pos, valid, tau):
 def loss_bucket(g, X_NSD, data, rng, E):
     """C1, supervised contrastive: positives = same-prompt labelled states in the same success-rate bucket."""
     groups = data["prompt_items"]  # per train prompt: array of (row, slot, bucket)
-    ps = rng.choice(len(groups), E.proj.batch // E.per_prompt, replace=len(groups) < E.proj.batch // E.per_prompt)
+    n_p = max(1, E.proj.batch // E.per_prompt)
+    ps = rng.choice(len(groups), n_p, replace=len(groups) < n_p)
     it = np.concatenate([groups[p][rng.choice(len(groups[p]), min(E.per_prompt, len(groups[p])), replace=False)] for p in ps])
     code = torch.tensor(np.repeat(ps, [min(E.per_prompt, len(groups[p])) for p in ps]), device=DEV)
     z = g(X_NSD[torch.as_tensor(it[:, 0], device=DEV), torch.as_tensor(it[:, 1], device=DEV)])
