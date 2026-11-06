@@ -31,10 +31,15 @@ def parse_queues(spec):
     return out
 
 
+def gres(gpu, gpus):
+    """--gpus 0 (CPU-only job) adds no gres; run.sbatch then sees SLURM_GPUS_ON_NODE unset."""
+    return [f"--gres=gpu:{gpu}:{gpus}"] if gpus else ["--cpus-per-task=16", "--mem=128G"]
+
+
 def best_queue(gpus, rtx, time="2-00:00:00", qs=None):
     """(partition, account, gpu type) with the earliest `sbatch --test-only` start (ISO timestamps sort as strings)."""
     def start(partition, account, gpu):
-        err = subprocess.run(["sbatch", "--test-only", f"--partition={partition}", f"--account={account}", f"--gres=gpu:{gpu}:{gpus}",
+        err = subprocess.run(["sbatch", "--test-only", f"--partition={partition}", f"--account={account}", *gres(gpu, gpus),
                               f"--time={time}", str(ROOT / "cluster/run.sbatch")], cwd=ROOT, capture_output=True, text=True).stderr
         m = re.search(r"to start at (\S+)", err)
         return m.group(1) if m else "9999"  # partition lacks this GPU type
@@ -59,7 +64,7 @@ def main(argv):
     for extra in ([[f"shard={i}", f"num_shards={args.shards}"] for i in range(args.shards)] or [[]]):
         partition, account, gpu = best_queue(args.gpus, args.rtx, args.time, qs)
         subprocess.run(["sbatch", f"--job-name={cfg.exp}/{cfg.ablation}", f"--output={logs}/{cfg.ablation}-{args.entry}-%j.out",
-                        f"--partition={partition}", f"--account={account}", f"--gres=gpu:{gpu}:{args.gpus}", f"--time={args.time}",
+                        f"--partition={partition}", f"--account={account}", *gres(gpu, args.gpus), f"--time={args.time}",
                         str(ROOT / "cluster/run.sbatch"), args.entry, *overrides, *extra], cwd=ROOT, check=True)
         time.sleep(1)
 

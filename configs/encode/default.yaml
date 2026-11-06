@@ -1,1 +1,2 @@
 batch_tokens: 65536  # padded tokens per forward pass
+partial: false  # true: write index.parquet from the chunks that have states (dataset cut at a deadline)

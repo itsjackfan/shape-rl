@@ -6,3 +6,4 @@ wandb/
 .pytest_cache/
 .env
 .gitinfo
+/*.log

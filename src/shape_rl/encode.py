@@ -62,13 +62,16 @@ def chunk_states(model, rows, traces, batch_tokens, device):
     return h_v_ND, h_q_NAD
 
 
-def write_index(out):
-    """index.parquet = every branch row + (states file, row offset), once all rollout shards and their states exist."""
-    n_shards = OmegaConf.load(out / "config.yaml").num_shards
-    chunks = sorted((out / "rollout").glob(CHUNKS))
-    if (out / "index.parquet").exists() or len(list((out / "rollout").glob("s*.done"))) < n_shards:
+def write_index(out, partial=False):
+    """index.parquet = every branch row + (states file, row offset), once all rollout shards and their states exist.
+    partial=True: write it now from the chunks that have states (a dataset cut at a deadline)."""
+    if (out / "index.parquet").exists():
         return
-    if not all((out / "states" / f.name.replace(".parquet", ".safetensors")).exists() for f in chunks):
+    chunks = sorted((out / "rollout").glob(CHUNKS))
+    has_states = [(out / "states" / f"{f.stem}.safetensors").exists() for f in chunks]
+    if partial:
+        chunks = [f for f, h in zip(chunks, has_states) if h]
+    elif len(list((out / "rollout").glob("s*.done"))) < OmegaConf.load(out / "config.yaml").num_shards or not all(has_states):
         return
     dfs = [pd.read_parquet(f).assign(states=f"states/{f.stem}.safetensors", row=lambda d: range(len(d))) for f in chunks]
     tmp = out / "index.tmp"
@@ -94,7 +97,7 @@ def run(cfg):
         save_file({"h_v": h_v, "h_q": h_q}, tmp)
         tmp.rename(dst)
         print(f"[encode] {f.name}: {len(h_v)} rows, {time.time() - t0:.0f}s", flush=True)
-    write_index(out)
+    write_index(out, cfg.encode.partial)
 
 
 @hydra.main(config_path="../../configs", config_name="encode", version_base=None)
