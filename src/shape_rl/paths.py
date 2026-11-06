@@ -43,8 +43,10 @@ def fresh_dir(path) -> Path:
 
 
 def job_dir(path) -> Path:
-    """fresh_dir, except a requeued SLURM job reuses its own dir and resumes."""
+    """fresh_dir, except a requeued SLURM job reuses its own dir and resumes. A job preempted before its first start made
+    the dir makes it on the requeue."""
     if int(os.environ.get("SLURM_RESTART_COUNT", 0)) > 0:
+        Path(path).mkdir(parents=True, exist_ok=True)
         return Path(path)
     return fresh_dir(path)
 

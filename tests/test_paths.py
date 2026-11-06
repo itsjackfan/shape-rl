@@ -52,3 +52,8 @@ def test_job_dir_resumes_on_requeue(tmp_path, monkeypatch):
         paths.job_dir(d)
     monkeypatch.setenv("SLURM_RESTART_COUNT", "1")
     assert paths.job_dir(d) == d
+
+
+def test_job_dir_requeue_before_first_start(tmp_path, monkeypatch):
+    monkeypatch.setenv("SLURM_RESTART_COUNT", "2")
+    assert paths.job_dir(tmp_path / "abl").is_dir()
