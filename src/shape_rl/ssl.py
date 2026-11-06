@@ -334,17 +334,18 @@ def run(cfg):
     out = paths.job_dir(paths.run_dir(cfg))
     OmegaConf.save(cfg, out / "config.yaml", resolve=True)
     data = prepare(cfg)
-    test = (data["idx"].split == "test").values
-    res = {"ceiling": ceiling(data, test), "seeds": {}}
+    test, val = ((data["idx"].split == s).values for s in ("test", "val"))
+    res = {"ceiling": ceiling(data, test), "seeds": {}, "val_seeds": {}}  # val: model choices (C3's representation)
     for seed in cfg.ssl.seeds:
         t0 = time.time()
         p_NS = estimate(data, cfg.estimator, seed)
-        res["seeds"][seed] = metrics(p_NS, data, test)
+        res["seeds"][seed], res["val_seeds"][seed] = metrics(p_NS, data, test), metrics(p_NS, data, val)
         np.save(out / f"pred_seed{seed}.npy", p_NS.astype(np.float32))
         print(f"[ssl] {cfg.ablation} seed {seed}: {res['seeds'][seed]} ({time.time() - t0:.0f}s)", flush=True)
     keys = next(iter(res["seeds"].values())).keys()
     res["mean"] = {k: float(np.mean([s[k] for s in res["seeds"].values()])) for k in keys}
     res["std"] = {k: float(np.std([s[k] for s in res["seeds"].values()])) for k in keys}
+    res["val_mean"] = {k: float(np.mean([s[k] for s in res["val_seeds"].values()])) for k in keys}
     (out / "metrics.json").write_text(json.dumps(res, indent=2))
     logger = WandbLogger(cfg, out)
     logger.log({**{f"test/{k}": v for k, v in res["mean"].items()}, **{f"test/ceiling/{k}": v for k, v in res["ceiling"].items()},
