@@ -22,6 +22,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from shape_rl import paths
+from shape_rl.data import chat_prompt_ids
 from shape_rl.rewards import grade, stop_ids
 
 
@@ -148,9 +149,7 @@ def special_ids(tok) -> set:
 def sample_prompts(eng, tok, df, cfg, ck: Checkpoint) -> pd.DataFrame:
     """Stage A: `samples` traces per prompt at the policy temperature, graded; pass_rate over finished traces."""
     R, cap = cfg.rollout, cfg.model.max_new_tokens
-    kw = OmegaConf.to_container(cfg.model.get("chat_template_kwargs", {}))
-    ids = [tok(tok.apply_chat_template(list(m), tokenize=False, add_generation_prompt=True, **kw), add_special_tokens=False).input_ids
-           for m in df.messages]
+    ids = [chat_prompt_ids(tok, m, cfg.model.chat_template_kwargs) for m in df.messages]
     df = df.assign(prompt_ids=ids)[[len(i) <= R.max_prompt_len for i in ids]].reset_index(drop=True)
     done = ck.setdefault("A", {})  # prompt_id -> [(token_ids, finished)] * samples
     eng.run(list(df.prompt_ids), R.samples, [cap] * len(df), R.temperature, [None if p in done else p for p in df.prompt_id],
@@ -162,17 +161,13 @@ def sample_prompts(eng, tok, df, cfg, ck: Checkpoint) -> pd.DataFrame:
     return df.drop(columns=["messages"])
 
 
-def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, excluded, ck: Checkpoint):
-    """Stages B + C for one chunk of kept prompts -> (one row per branch point, one row per branched trace).
-    ck holds stage B (so a resumed chunk builds the same requests) and the graded outcomes of finished requests."""
+def branch_requests(traces, tops, cfg, excluded):
+    """Stage B: branch points of each trace and their continuation requests -> (rows, reqs). Row i owns 2 + n_alt requests:
+    reqs[i * (2 + n_alt)] continues from s_t (V), reqs[i * (2 + n_alt) + 1 + j] from s_t + actions[j] (Q).
+    A request = (prefix ids, max_tokens, response head). tops[i]: per position {id: (logprob, rank)} of trace i."""
     R, cap = cfg.rollout, cfg.model.max_new_tokens
-    traces = [(p, k, p.sample_ids[k].tolist()) for p in chunk.itertuples()
-              for k in select_traces(p.sample_rewards, R.max_correct, R.max_incorrect)]
-    if "tops" not in ck:
-        ck["tops"] = eng.topk([p.prompt_ids.tolist() + r for p, _, r in traces], R.top_logprobs)
-        ck.save()
-    rows, reqs = [], []  # reqs: (prefix ids, max_tokens, response head)
-    for (p, k, r), top in zip(traces, ck["tops"]):
+    rows, reqs = [], []
+    for (p, k, r), top in zip(traces, tops):
         P = len(p.prompt_ids)
         top_T = top[P:P + len(r)]  # top_T[t]: pi(.|s_t), includes r_t
         H_T = np.array([topk_entropy(np.array([lp for lp, rank in d.values() if rank <= R.top_logprobs])) for d in top_T])
@@ -189,17 +184,30 @@ def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, excluded, ck: Checkpoint):
                              "trace_len": len(r), "reward": p.sample_rewards[k], "t": t, "pos": P + t, "kind": kind,
                              "entropy": H_T[t], "entropy_prev": H_T[t - 1], "logprob_prev": top_T[t - 1][r[t - 1]][0],
                              "actions": acts, "action_logprobs": [top_T[t][a][0] for a in acts]})
-    A = 1 + R.n_alt
+    return rows, reqs
+
+
+def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, excluded, ck: Checkpoint):
+    """Stages B + C for one chunk of kept prompts -> (one row per branch point, one row per branched trace).
+    ck holds the top-k logprobs (so a resumed chunk builds the same requests) and the graded outcomes of finished requests."""
+    R = cfg.rollout
+    traces = [(p, k, p.sample_ids[k].tolist()) for p in chunk.itertuples()
+              for k in select_traces(p.sample_rewards, R.max_correct, R.max_incorrect)]
+    if "tops" not in ck:
+        ck["tops"] = eng.topk([p.prompt_ids.tolist() + r for p, _, r in traces], R.top_logprobs)
+        ck.save()
+    rows, reqs = branch_requests(traces, ck["tops"], cfg, excluded)
+    per_row = 2 + R.n_alt
     done = ck.setdefault("C", {})  # request index -> [(outcome code, generated tokens)] * M
 
     def on_done(q, outs):
-        head, ans = reqs[q][2], rows[q // (1 + A)]["answer"]
+        head, ans = reqs[q][2], rows[q // per_row]["answer"]
         done[q] = [(grade(tok.decode(head + c, skip_special_tokens=True), fin, ans), len(c)) for c, fin in outs]
 
     eng.run([q[0] for q in reqs], R.M, [q[1] for q in reqs], R.temperature, [None if q in done else q for q in range(len(reqs))],
             on_done, ck.save)
     for i, row in enumerate(rows):
-        res = [done[i * (1 + A) + j] for j in range(1 + A)]
+        res = [done[i * per_row + j] for j in range(per_row)]
         row["v_out"], row["q_out"] = [c for c, _ in res[0]], [c for x in res[1:] for c, _ in x]
         row["gen_tokens"] = sum(n for x in res for _, n in x)
     return pd.DataFrame(rows), pd.DataFrame({"trace_id": [f"{p.prompt_id}-{k}" for p, k, _ in traces],

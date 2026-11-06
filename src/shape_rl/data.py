@@ -27,3 +27,9 @@ def math(split="train"):
 
 def load_train(train_cfg) -> datasets.Dataset:
     return datasets.concatenate_datasets([instantiate(c) for c in train_cfg.values()])
+
+
+def chat_prompt_ids(tok, messages, chat_template_kwargs) -> list[int]:
+    """Token ids of the chat-templated prompt with the generation prompt (the policy input in rollout, RL and eval)."""
+    text = tok.apply_chat_template(list(messages), tokenize=False, add_generation_prompt=True, **chat_template_kwargs)
+    return tok(text, add_special_tokens=False).input_ids
