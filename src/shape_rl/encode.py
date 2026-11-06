@@ -5,7 +5,9 @@ For a branch row (pos = prompt_len + t, see rollout.py):
   h_q[i, j] = state at pos with input token actions[j] = h(s_t, a) (j = 0: sampled a_t, j >= 1: a'_j): input for Q(s_t, a).
 States are post-norm last-layer, bf16 (hidden.states_at). N = branch rows, A = actions, D = hidden size, B/L/P as in hidden.py.
 """
+import os
 import time
+import zlib
 from collections import defaultdict
 
 import hydra
@@ -86,14 +88,15 @@ def run(cfg):
     (out / "states").mkdir(exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = None
-    for f in sorted((out / "rollout").glob(CHUNKS))[cfg.shard::cfg.num_shards]:
+    # a chunk's encode shard is fixed by its name, so jobs started while the rollout still adds chunks never overlap
+    for f in [f for f in sorted((out / "rollout").glob(CHUNKS)) if zlib.crc32(f.name.encode()) % cfg.num_shards == cfg.shard]:
         dst = out / "states" / f"{f.stem}.safetensors"
         if dst.exists():
             continue
         model = model or load_model(cfg.model.path).to(device)
         t0 = time.time()
         h_v, h_q = chunk_states(model, pd.read_parquet(f), pd.read_parquet(f.with_suffix(".traces.parquet")), cfg.encode.batch_tokens, device)
-        tmp = dst.with_suffix(".tmp")
+        tmp = dst.with_name(f"{dst.stem}.{os.getpid()}.tmp")
         save_file({"h_v": h_v, "h_q": h_q}, tmp)
         tmp.rename(dst)
         print(f"[encode] {f.name}: {len(h_v)} rows, {time.time() - t0:.0f}s", flush=True)
