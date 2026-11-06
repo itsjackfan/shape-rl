@@ -64,6 +64,19 @@ nz = np.abs(QA[:, 0] - QB[:, 0])
 nz = nz[~np.isnan(nz)]
 h1["noise_ref_halfM_same_action"] = {"n": int(len(nz)), "mean": float(nz.mean()), "P(>=0.25)": float(np.mean(nz >= 0.25)),
                                      "P(>=0.5)": float(np.mean(nz >= 0.5))}
+# M-matched null: if Q(a') = Q(a_t), both MC rates are Binomial(n_finished, pooled rate); |dQ| over 20 simulations
+fin = (q >= 0).sum(-1)
+succ = (q == 1).sum(-1)
+null = []
+for _ in range(20):
+    for j in (1, 2):
+        n0, n1 = fin[:, 0], fin[:, j]
+        ok = (n0 > 0) & (n1 > 0)
+        pool = (succ[ok, 0] + succ[ok, j]) / (n0[ok] + n1[ok])
+        null.append(np.abs(rng.binomial(n1[ok], pool) / n1[ok] - rng.binomial(n0[ok], pool) / n0[ok]))
+null = np.concatenate(null)
+h1["null_Mmatched_same_Q"] = {"n_sims": 20, "mean": float(null.mean()), "P(>0)": float(np.mean(null > 0)), "P(>=0.25)": float(np.mean(null >= 0.25)),
+                              "P(>=0.5)": float(np.mean(null >= 0.5)), "P(>=0.75)": float(np.mean(null >= 0.75))}
 h1["mean_entropy_by_kind"] = R.groupby("kind").entropy.mean().to_dict()
 h1["mean_logprob_alt_by_kind"] = {k: float(np.mean(np.stack(g.action_logprobs.values)[:, 1:])) for k, g in R.groupby("kind")}
 stats["h1"] = h1
@@ -74,8 +87,8 @@ bins = np.arange(0, 1.0001 + 1 / 8, 1 / 8) - 1 / 16
 fig, ax = plt.subplots(figsize=(5.5, 3.5))
 for x, kind, color in ((xe, "high-entropy", "#d95f02"), (xr, "random", "#1b9e77")):
     ax.hist(x, bins=bins, weights=np.full(len(x), 1 / len(x)), histtype="step", lw=2, color=color, label=f"{kind} (n={len(x)})")
-ax.hist(nz, bins=bins, weights=np.full(len(nz), 1 / len(nz)), histtype="step", lw=1.5, ls="--", color="gray",
-        label=f"noise ref: same action, M/2 vs M/2 (n={len(nz)})")
+ax.hist(null, bins=bins, weights=np.full(len(null), 1 / len(null)), histtype="step", lw=1.5, ls="--", color="gray",
+        label="null: Q(a') = Q(a_t), binomial at pooled rate")
 ax.set_xlabel(f"|Q(s_t, a') - Q(s_t, a_t)|  (MC, M = {M})")
 ax.set_ylabel("fraction of pairs")
 ax.set_yscale("log")

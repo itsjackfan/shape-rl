@@ -40,7 +40,7 @@ def test_ssl_smoke(cfg_factory, est):
     fake_dataset(ssl.Path(cfg.output_root) / "data/fake")
     res = ssl.run(cfg)
     m = res["mean"]
-    assert {"auroc", "auroc_resid", "spearman_A", "spearman_A_resid", "sign_acc", "ece"} <= set(m)
+    assert {"auroc", "succ_pcorr", "succ_pcorr_resid", "spearman_A", "spearman_A_resid", "sign_acc", "ece"} <= set(m)
     assert 0 <= m["sign_acc"] <= 1 and 0 <= m["ece"] <= 1 and 0 < res["ceiling"]["reliability_Q"] <= 1
     np.testing.assert_equal(json.loads((ssl.paths.run_dir(cfg) / "metrics.json").read_text())["mean"], m)  # NaN-safe (B0 is constant)
     if est == "b2":  # a linear probe recovers a linear signal

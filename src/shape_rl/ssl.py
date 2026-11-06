@@ -230,18 +230,29 @@ def residual(x, Z):
     return x - Z1 @ np.linalg.lstsq(Z1, x, rcond=None)[0]
 
 
+def partial_corr(x, y, Z, groups):
+    """Correlation of x and y after removing per-group means (prompt fixed effects) and then a linear fit on Z from both."""
+    d = pd.DataFrame(np.c_[x, y, Z]).groupby(groups).transform(lambda c: c - c.mean()).values
+    r = d[:, :2] - d[:, 2:] @ np.linalg.lstsq(d[:, 2:], d[:, :2], rcond=None)[0] if Z.shape[1] else d[:, :2]
+    return float(np.corrcoef(r[:, 0], r[:, 1])[0, 1]) if r[:, 0].std() > 1e-12 else float("nan")
+
+
 def auroc_within(score, label, prompt):
     a = [roc_auc_score(label[m], score[m]) for p in np.unique(prompt) if len(np.unique(label[m := prompt == p])) == 2]
     return float(np.mean(a))
 
 
 def metrics(p_NS, data, test):
-    """AUROC (trace success from V_pred at h(s_t), within prompt), Spearman(A_pred, A_MC), sign accuracy of
-    Q(a') - Q(a_t), ECE; '_resid' = with position, trace length, relative position and truncation regressed out."""
+    """AUROC (trace success from V_pred at h(s_t), within prompt); succ_pcorr: within-prompt correlation of V_pred with
+    trace success, '_resid' with position, trace length, relative position and truncation regressed out of both;
+    Spearman(A_pred, A_MC) ('_resid': ranks of both residualized on the confounds); sign accuracy of Q(a') - Q(a_t) (pairs
+    share position and trace, so they need no confound control); ECE."""
     idx, R, fin, conf = data["idx"][test], data["rate"][test], data["fin"][test], data["conf"][test]
     p = p_NS[test]
-    out = {"auroc": auroc_within(p[:, 0], idx.reward.values, idx.prompt_id.values),
-           "auroc_resid": auroc_within(residual(p[:, 0], conf), idx.reward.values, idx.prompt_id.values)}
+    y, g = idx.reward.values.astype(float), idx.prompt_id.values
+    out = {"auroc": auroc_within(p[:, 0], idx.reward.values, g),
+           "succ_pcorr": partial_corr(p[:, 0], y, np.zeros((len(y), 0)), g),  # within prompt
+           "succ_pcorr_resid": partial_corr(p[:, 0], y, (conf - conf.mean(0)) / (conf.std(0) + 1e-9), g)}  # and confounds out
     A_mc, A_pr = (R[:, 1:] - R[:, :1]), (p[:, 1:] - p[:, :1])
     m = ~np.isnan(A_mc)
     out["spearman_A"] = float(spearmanr(A_pr[m], A_mc[m])[0]) if A_pr[m].std() > 0 else float("nan")
@@ -290,7 +301,8 @@ def ceiling(data, test, n_splits=20, seed=0):
     return {"reliability_A": rel["A"], "reliability_Q": rel["Q"], "reliability_dQ": rel["dQ"],
             "spearman_A": float(np.sqrt(max(rel["A"], 0))), "sign_acc_halfM": float((1 + np.sqrt(max(2 * agree - 1, 0))) / 2),
             "sign_agree_halves": agree,
-            "auroc": auroc_within(R[m, 0], idx.reward.values[m], idx.prompt_id.values[m])}
+            "auroc": auroc_within(R[m, 0], idx.reward.values[m], idx.prompt_id.values[m]),
+            "succ_pcorr": partial_corr(R[m, 0], idx.reward.values[m].astype(float), np.zeros((m.sum(), 0)), idx.prompt_id.values[m])}
 
 
 def prepare(cfg):
