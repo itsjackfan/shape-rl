@@ -1,4 +1,5 @@
-"""Hidden states at branch points -> one safetensors file per rollout chunk, plus one parquet index. Sharded, resumable.
+"""Hidden states at branch points -> one safetensors file per rollout chunk, plus one parquet index. Any number of jobs
+share the chunks through claim files (states/<chunk>.claim); resumable.
 
 For a branch row (pos = prompt_len + t, see rollout.py):
   h_v[i]    = state at pos - 1 of the trace = h(s_t): it predicts pi(.|s_t), so it is the input for V(s_t).
@@ -7,7 +8,6 @@ States are post-norm last-layer, bf16 (hidden.states_at). N = branch rows, A = a
 """
 import os
 import time
-import zlib
 from collections import defaultdict
 
 import hydra
@@ -33,8 +33,8 @@ def requests(rows: pd.DataFrame, traces: pd.DataFrame):
     return reqs + [(seq[tid].tolist(), ps) for tid, ps in at_trace.items()]
 
 
-def chunk_states(model, rows, traces, batch_tokens, device):
-    """-> h_v [N, D], h_q [N, A, D] (bf16, CPU). Length-sorted, right-padded batches of <= batch_tokens tokens."""
+def chunk_states(model, rows, traces, batch_tokens, device, beat=lambda: None):
+    """-> h_v [N, D], h_q [N, A, D] (bf16, CPU). Length-sorted, right-padded batches of <= batch_tokens tokens; beat() per batch."""
     reqs = requests(rows, traces)
     N, A, D = len(rows), len(rows.actions.iloc[0]), final_norm(model).weight.shape[0]
     h_v_ND, h_q_NAD = torch.empty(N, D, dtype=torch.bfloat16), torch.empty(N, A, D, dtype=torch.bfloat16)
@@ -53,6 +53,7 @@ def chunk_states(model, rows, traces, batch_tokens, device):
                     h_v_ND[i] = x_BPD[b, p]
                 else:
                     h_q_NAD[i, j] = x_BPD[b, p]
+        beat()
 
     batch = []
     for k in sorted(range(len(reqs)), key=lambda k: len(reqs[k][0])):
@@ -64,43 +65,66 @@ def chunk_states(model, rows, traces, batch_tokens, device):
     return h_v_ND, h_q_NAD
 
 
-def write_index(out, partial=False):
-    """index.parquet = every branch row + (states file, row offset), once all rollout shards and their states exist.
-    partial=True: write it now from the chunks that have states (a dataset cut at a deadline)."""
-    if (out / "index.parquet").exists():
-        return
+def write_index(out):
+    """index.parquet = every branch row + (states file, row offset). Written once the chunk set is final (every rollout shard
+    done, or rollout/STOP: the dataset was cut at a deadline after the rollout jobs ended) and every chunk has states."""
     chunks = sorted((out / "rollout").glob(CHUNKS))
-    has_states = [(out / "states" / f"{f.stem}.safetensors").exists() for f in chunks]
-    if partial:
-        chunks = [f for f, h in zip(chunks, has_states) if h]
-    elif len(list((out / "rollout").glob("s*.done"))) < OmegaConf.load(out / "config.yaml").num_shards or not all(has_states):
+    final = (out / "rollout" / "STOP").exists() or len(list((out / "rollout").glob("s*.done"))) >= OmegaConf.load(out / "config.yaml").num_shards
+    if (out / "index.parquet").exists() or not final or not all((out / "states" / f"{f.stem}.safetensors").exists() for f in chunks):
         return
     dfs = [pd.read_parquet(f).assign(states=f"states/{f.stem}.safetensors", row=lambda d: range(len(d))) for f in chunks]
-    tmp = out / "index.tmp"
+    tmp = out / f"index.{os.getpid()}.tmp"
     pd.concat(dfs, ignore_index=True).to_parquet(tmp)
     tmp.rename(out / "index.parquet")
 
 
+def claim(path, stale_s=300):
+    """Exclusive claim on a chunk; a claim older than stale_s (a preempted job) is taken over."""
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        return True
+    except FileExistsError:
+        if time.time() - path.stat().st_mtime < stale_s:
+            return False
+        path.unlink(missing_ok=True)
+        return claim(path, stale_s)
+
+
+def encode_pending(cfg, out, model, device):
+    """Encode every chunk that has no states and no live claim. -> model, number done."""
+    n = 0
+    for f in sorted((out / "rollout").glob(CHUNKS)):
+        dst, lock = out / "states" / f"{f.stem}.safetensors", out / "states" / f"{f.stem}.claim"
+        if dst.exists() or not claim(lock):
+            continue
+        model = model or load_model(cfg.model.path).to(device)
+        t0 = time.time()
+        h_v, h_q = chunk_states(model, pd.read_parquet(f), pd.read_parquet(f.with_suffix(".traces.parquet")), cfg.encode.batch_tokens, device,
+                                beat=lambda: os.utime(lock))
+        tmp = dst.with_name(f"{dst.stem}.{os.getpid()}.tmp")
+        save_file({"h_v": h_v, "h_q": h_q}, tmp)
+        tmp.rename(dst)
+        n += 1
+        print(f"[encode] {f.name}: {len(h_v)} rows, {time.time() - t0:.0f}s", flush=True)
+    return model, n
+
+
 def run(cfg):
+    """encode.follow: keep encoding new chunks while the rollout runs, until rollout/STOP exists (then a last pass)."""
     paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
     out = paths.run_dir(cfg)
     assert OmegaConf.load(out / "config.yaml").model.path == cfg.model.path, "encode with the rollout's model"
     (out / "states").mkdir(exist_ok=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = None
-    # a chunk's encode shard is fixed by its name, so jobs started while the rollout still adds chunks never overlap
-    for f in [f for f in sorted((out / "rollout").glob(CHUNKS)) if zlib.crc32(f.name.encode()) % cfg.num_shards == cfg.shard]:
-        dst = out / "states" / f"{f.stem}.safetensors"
-        if dst.exists():
-            continue
-        model = model or load_model(cfg.model.path).to(device)
-        t0 = time.time()
-        h_v, h_q = chunk_states(model, pd.read_parquet(f), pd.read_parquet(f.with_suffix(".traces.parquet")), cfg.encode.batch_tokens, device)
-        tmp = dst.with_name(f"{dst.stem}.{os.getpid()}.tmp")
-        save_file({"h_v": h_v, "h_q": h_q}, tmp)
-        tmp.rename(dst)
-        print(f"[encode] {f.name}: {len(h_v)} rows, {time.time() - t0:.0f}s", flush=True)
-    write_index(out, cfg.encode.partial)
+    while True:
+        stop = (out / "rollout" / "STOP").exists()
+        model, n = encode_pending(cfg, out, model, device)
+        if not cfg.encode.follow or stop:
+            break
+        if n == 0:
+            time.sleep(60)
+    write_index(out)
 
 
 @hydra.main(config_path="../../configs", config_name="encode", version_base=None)

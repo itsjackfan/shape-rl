@@ -1,2 +1,2 @@
 batch_tokens: 65536  # padded tokens per forward pass
-partial: false  # true: write index.parquet from the chunks that have states (dataset cut at a deadline)
+follow: false  # true: keep encoding new rollout chunks until rollout/STOP exists (cut at a deadline), then write the index
