@@ -55,7 +55,7 @@ class ShapeTrainer(GRPOTrainer):
     def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, **kw):
         if not self._scoring:  # the training forward: counted in _count_batch
             return super()._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, batch_size, **kw)
-        self._flops_local += self.flop_model.forward(attention_mask.sum(1))
+        self._n_scoring += 1
         if self._capture is None or model is not self.model:
             return super()._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, batch_size, **kw)
         # hidden-state capture: each sub-batch forward hits the hook once, rows in order
@@ -84,7 +84,7 @@ class ShapeTrainer(GRPOTrainer):
     def _score_round(self, inputs):
         """One TRL generation + scoring round, with state capture and FLOP counts. -> (output, rewards_N, correct_N)."""
         needs = self.estimator is not None and self.estimator.needs_states
-        self._capture, self._scoring = ([] if needs else None), True
+        self._capture, self._scoring, self._n_scoring = ([] if needs else None), True, 0
         try:
             out = super()._generate_and_score_completions(inputs)
             if needs and not self._capture:  # no scoring forward ran (no vLLM IS correction): run one for the states
@@ -95,8 +95,8 @@ class ShapeTrainer(GRPOTrainer):
                                                             batch_size=self.args.per_device_train_batch_size)
         finally:
             self._scoring = False
-        prompt_len = out["prompt_mask"].sum(1)
-        self._flops_local += self.flop_model.forward(prompt_len + self._gen_lengths_n)  # generation (prefill + decode)
+        out["seq_len"] = out["prompt_mask"].sum(1) + self._gen_lengths_n  # prompt + generated tokens (masking aside)
+        self._flops_local += (1 + self._n_scoring) * self.flop_model.forward(out["seq_len"])  # generation + scoring forwards
         rewards_NF = self._rewards_NF
         rewards_N = (rewards_NF * self.reward_weights.to(rewards_NF.device)).nansum(dim=1)
         rewards_N[torch.isnan(rewards_NF).all(dim=1)] = torch.nan  # TRL's unscorable rule
@@ -105,8 +105,7 @@ class ShapeTrainer(GRPOTrainer):
 
     def _count_batch(self, out):
         """Training FLOPs of the final batch: forward + backward per pass over its real tokens; reduce the step's count."""
-        L = out["prompt_mask"].sum(1) + out["completion_mask"].sum(1)
-        self._flops_local += 3 * self.num_iterations * self.flop_model.forward(L)
+        self._flops_local += 3 * self.num_iterations * self.flop_model.forward(out["seq_len"])
         if self.estimator is not None:
             self._flops_local += self.estimator.flops
             self.estimator.flops = 0.0
@@ -119,19 +118,19 @@ class ShapeTrainer(GRPOTrainer):
     def _generate_and_score_completions(self, inputs):
         mode = "train" if self.model.training else "eval"
         out, rewards_N, correct_N = self._score_round(inputs)
+        suites = gather_object([x["suite"] for x in inputs])  # scores of the sampled prompts (before any filter)
+        self._metrics[mode]["mean_score"].append(correct_N.nanmean().item())
+        for s in set(suites):
+            self._metrics[mode][f"{s}/mean_score"].append(correct_N[[x == s for x in suites]].nanmean().item())
         if self.dynamic_sampling and mode == "train":
             out, correct_N = self._dynamic_sample(inputs, out, rewards_N, correct_N)
-        suites = gather_object([x["suite"] for x in inputs])
-        if len(suites) == len(correct_N):  # per-suite scores of the scored batch (first round under dynamic sampling)
-            self._metrics[mode]["mean_score"].append(correct_N.nanmean().item())
-            for s in set(suites):
-                self._metrics[mode][f"{s}/mean_score"].append(correct_N[[x == s for x in suites]].nanmean().item())
 
         if self.estimator is not None:
             G = self.num_generations if mode == "train" else self.num_generations_eval
             n = len(out["advantages"])
             local = slice(self.accelerator.process_index * n, (self.accelerator.process_index + 1) * n)
             obs = {k: torch.cat([c[k] for c in self._capture]) for k in self._capture[0]} if self._capture else {}
+            self.estimator.train(mode == "train")  # the online head fits on training batches only
             adv = self.estimator(rewards_N, G, local, obs)
             assert adv.shape[0] == n and (adv.dim() == 1 or adv.shape[1] == out["completion_ids"].shape[1]), adv.shape
             out["advantages"] = adv
@@ -149,6 +148,10 @@ class ShapeTrainer(GRPOTrainer):
         if mode == "train":
             self._count_batch(out)
             self._metrics[mode]["flops"] = [self.flops_total]
+        else:  # eval generations are not part of the training process
+            self._flops_local = 0.0
+            if self.estimator is not None:
+                self.estimator.flops = 0.0
         return out
 
     # ---- DAPO dynamic sampling
@@ -158,7 +161,7 @@ class ShapeTrainer(GRPOTrainer):
         as TRL's RepeatSampler does (each prompt G times in a row, process p takes rows p*n .. p*n+n-1)."""
         G, n, p = self.num_generations, len(inputs), self.accelerator.process_index
         n_prompts = n * self.accelerator.num_processes // G
-        gen = torch.Generator().manual_seed(self.args.seed * 1_000_003 + self.state.global_step * 1009 + round_)
+        gen = torch.Generator().manual_seed(self.args.seed * 1_000_003 + self._step * 1009 + round_)  # TRL's micro-step count
         idx = torch.randint(len(self.train_dataset), (n_prompts,), generator=gen).repeat_interleave(G)
         return [self.train_dataset[int(i)] for i in idx[p * n:(p + 1) * n]]
 
@@ -199,6 +202,7 @@ class ShapeTrainer(GRPOTrainer):
     def _gather_rounds(self, outs):
         """Every round's per-row tensors from all processes, padded to common widths (prompt keys on the left,
         completion keys on the right): [{key: (N, ...)}] per round."""
+        assert "sampling_mask" not in outs[0], "dynamic sampling does not support top_p / top_k / min_p sampling masks"
         pad_id = self._tokenizer.pad_token_id
         P = max(int(o["prompt_ids"].shape[1]) for o in outs)
         T = max(int(o["completion_ids"].shape[1]) for o in outs)
@@ -235,7 +239,10 @@ class ShapeTrainer(GRPOTrainer):
 
     def _load_optimizer_and_scheduler(self, checkpoint):
         super()._load_optimizer_and_scheduler(checkpoint)
-        if checkpoint is not None and os.path.exists(f := os.path.join(checkpoint, "shape_state.pt")):
+        if checkpoint is not None:
+            f = os.path.join(checkpoint, "shape_state.pt")
+            if not os.path.exists(f):  # preempted between the model save and this file: do not restart the count at 0
+                raise FileNotFoundError(f"{f} is missing; resume from an earlier checkpoint (delete {checkpoint} after review).")
             state = torch.load(f, map_location="cpu", weights_only=False)
             self.flops_total, self.flops_saved_mark = state["flops_total"], state["flops_saved_mark"]
             if self.estimator is not None and state["estimator"] is not None:

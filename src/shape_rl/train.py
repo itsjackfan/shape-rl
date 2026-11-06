@@ -22,8 +22,9 @@ def train_dataset(cfg):
     """Train prompts whose chat-templated length is <= max_prompt_len tokens (the rule of rollout.py)."""
     tok, kw = AutoTokenizer.from_pretrained(cfg.model.path), OmegaConf.to_container(cfg.model.chat_template_kwargs)
     ds = data.load_train(cfg.data.train)
-    return ds.filter(lambda x: len(tok.apply_chat_template(x["prompt"], add_generation_prompt=True, tokenize=True, **kw))
-                     <= cfg.max_prompt_len)
+    n_tok = lambda m: len(tok(tok.apply_chat_template(m, tokenize=False, add_generation_prompt=True, **kw),
+                              add_special_tokens=False).input_ids)
+    return ds.filter(lambda x: n_tok(x["prompt"]) <= cfg.max_prompt_len)
 
 
 def run(cfg):

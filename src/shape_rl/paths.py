@@ -16,9 +16,12 @@ def exp_name() -> str:
 
 
 def code_hash() -> str:
-    """sha1 of the code a job runs (src/ and configs/), committed or not."""
+    """sha1 of the code a job runs (src/ and configs/, committed or not). Eval-only configs are left out, so that a new
+    benchmark does not stop a preempted training job from resuming."""
     h = hashlib.sha1()
-    for f in sorted([*(ROOT / "src").rglob("*.py"), *(ROOT / "configs").rglob("*.yaml"), *(ROOT / "configs").rglob("*.py")]):
+    eval_only = ("configs/eval.yaml", "configs/data/eval/", "configs/lm_eval/")
+    files = [*(ROOT / "src").rglob("*.py"), *(ROOT / "configs").rglob("*.yaml"), *(ROOT / "configs").rglob("*.py")]
+    for f in sorted(f for f in files if not str(f.relative_to(ROOT)).startswith(eval_only)):
         h.update(str(f.relative_to(ROOT)).encode() + b"\0" + f.read_bytes())
     return h.hexdigest()[:12]
 

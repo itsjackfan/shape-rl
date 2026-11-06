@@ -130,11 +130,18 @@ class HiddenValue(AdvantageEstimator):
         return list(self.head.parameters()) if self.train_mode == "all" else []
 
     def _setup(self, h_bTD, mask_bT):
-        if self.head is None:  # new head: standardize with the first batch's states
+        if self.head is None:  # new head: standardize with the first batch's states, pooled over processes
             x = h_bTD[mask_bT.bool()].float()
-            self.head = ValueHead(h_bTD.shape[-1], None, self.hidden if self.kind == "mlp" else 0)
-            self.head.mu.copy_(x.mean(0).cpu())
-            self.head.sd.copy_(x.std(0).cpu() + 1e-4)
+            stats = torch.cat([x.sum(0), (x * x).sum(0), x.new_tensor([len(x)])])
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(stats)
+            D = h_bTD.shape[-1]
+            n = stats[-1].clamp(min=2)
+            mu = stats[:D] / n
+            var = (stats[D:2 * D] - n * mu * mu) / (n - 1)
+            self.head = ValueHead(D, None, self.hidden if self.kind == "mlp" else 0)
+            self.head.mu.copy_(mu.cpu())
+            self.head.sd.copy_(var.clamp(min=0).sqrt().cpu() + 1e-4)
         self.head.to(h_bTD.device)
         if self.opt is None and self._params():
             self.opt = torch.optim.AdamW(self._params(), lr=self.lr, weight_decay=1e-2)
@@ -181,14 +188,14 @@ class HiddenValue(AdvantageEstimator):
         A = A * ok_n[:, None]
         first = V[:, 0]
         self.metrics = {"V0_mean": float(first.mean()), "abs_adv_mean": float((A.abs() * mask).sum() / mask.sum().clamp(min=1))}
-        if self.opt is not None:
+        if self.opt is not None and self.training:
             self._fit(obs["h_fit"], obs["fit_ok"] & ok_n[:, None], r_n.clamp(0, 1))
         return A
 
     def _fit(self, h_nKD, ok_nK, y_n):
         """Online fit; gradients are averaged over processes (every process keeps the same head)."""
         x, y = h_nKD[ok_nK], y_n[:, None].expand_as(ok_nK)[ok_nK]
-        self.head.train()
+        (self.head.readout if self.train_mode == "readout" else self.head).train()  # a fixed projection keeps dropout off
         n_par = sum(p.numel() for p in self._params())
         for _ in range(self.steps):
             self.opt.zero_grad()

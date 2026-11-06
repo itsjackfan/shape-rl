@@ -16,8 +16,8 @@ train:
   lr_scheduler_type: constant
   num_train_epochs: 1
   max_steps: -1
-  per_device_train_batch_size: 8
-  gradient_accumulation_steps: 8  # 64 completions per GPU per optimizer step = 8 prompts x 8 generations
+  per_device_train_batch_size: 2  # logits of one micro-batch: 2 x 8192 x 248320 bf16 = 8 GB (8 rows would be 33 GB)
+  gradient_accumulation_steps: 32  # 64 completions per GPU per optimizer step = 8 prompts x 8 generations
   num_generations: 8
   max_completion_length: ${model.max_new_tokens}
   chat_template_kwargs: ${model.chat_template_kwargs}

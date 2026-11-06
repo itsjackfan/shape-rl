@@ -44,13 +44,14 @@ def grade(text: str, finished: bool, gold: str) -> int:
 
 
 def stop_ids(tok, model_path) -> set:
-    """Token ids that end a response: the tokenizer's eos + the generation config's eos ids (as TRL and vLLM use them)."""
-    from transformers import GenerationConfig
+    """Token ids that end a response, as TRL and vLLM use them: the tokenizer's eos + the eos ids of generation_config.json,
+    or of the model config when that file is missing (Qwen3.5-4B: <|im_end|> + <|endoftext|>)."""
+    from transformers import AutoConfig, GenerationConfig
 
     try:
         eos = GenerationConfig.from_pretrained(model_path).eos_token_id
-    except OSError:  # no generation_config.json
-        eos = None
+    except OSError:  # no generation_config.json: transformers and vLLM fall back to the model config
+        eos = AutoConfig.from_pretrained(model_path).get_text_config().eos_token_id
     return {tok.eos_token_id, *(eos if isinstance(eos, list) else [eos])} - {None}
 
 
