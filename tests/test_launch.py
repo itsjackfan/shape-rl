@@ -34,12 +34,22 @@ def test_best_queue_picks_earliest(fake_sbatch):
     assert any(q[0] == "kempner_rtx" for q in launch.queues(rtx=True))
 
 
-def test_launch_submits_logged(cfg_factory, fake_sbatch):
+def test_launch_submits_logged(cfg_factory, fake_sbatch, monkeypatch):
+    monkeypatch.delenv("SHAPE_RL_QUEUES", raising=False)
     cfg = cfg_factory()
     launch.main(["train", "exp=test-exp", "ablation=abl", f"output_root={cfg.output_root}", f"log_path={cfg.log_path}", "--gpus", "2"])
     (cmd,) = fake_sbatch
     assert "--gres=gpu:nvidia_h100_80gb_hbm3:2" in cmd and "--account=kempner_ydu_lab" in cmd
-    assert cmd[-5:] == ["train", "exp=test-exp", "ablation=abl", f"output_root={cfg.output_root}", f"log_path={cfg.log_path}"]
+    assert cmd[-6:] == ["train", "ablation=abl", f"output_root={cfg.output_root}", f"log_path={cfg.log_path}", "exp=test-exp",
+                        f"code={launch.paths.code_hash()}"]
+
+
+def test_launch_queues_from_env(cfg_factory, fake_sbatch, monkeypatch):
+    monkeypatch.setenv("SHAPE_RL_QUEUES", "kempner_requeue:kempner_krajan_lab:nvidia_h100_80gb_hbm3")
+    cfg = cfg_factory()
+    launch.main(["train", "exp=test-exp", "ablation=abl", f"output_root={cfg.output_root}", f"log_path={cfg.log_path}"])
+    (cmd,) = fake_sbatch
+    assert "--account=kempner_krajan_lab" in cmd
 
 
 def test_launch_refuses_unlogged(cfg_factory, fake_sbatch):

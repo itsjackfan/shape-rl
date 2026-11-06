@@ -1,3 +1,5 @@
 path: Qwen/Qwen3.5-4B
 chat_template_kwargs: {enable_thinking: false}  # Qwen3.5/3.6 templates open <think> unless this is false
-max_new_tokens: 4096  # response cap; set from the smoke so that <5% of traces truncate
+max_new_tokens: 8192  # response cap for rollout, train and eval; truncation (thinking off, GSM8K+MATH train, T=1): 3.8 % at 8192
+# cf-data/full was built with model.max_new_tokens=16384 (its config.yaml); 4096 truncates 11.5 %.
+trl: {}  # extra GRPOConfig kwargs for this model (vLLM sizing); merged before objective.trl

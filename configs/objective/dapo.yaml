@@ -1,7 +1,10 @@
-estimator: null
+# DAPO (Yu et al. 2025): clip-higher, dynamic sampling, token-level loss, overlong filtering + soft overlong punishment.
+defaults: [_base, _self_]
+dynamic_sampling: {max_rounds: 4}  # refill groups with equal correctness from fresh prompts; at most 4 generation rounds a step
+rewards:
+  overlong: {_target_: trl.rewards.get_soft_overlong_punishment, max_completion_len: "${model.max_new_tokens}", soft_punish_cache: 2048}
 trl:
   loss_type: dapo
   scale_rewards: group
   epsilon_high: 0.28
   mask_truncated_completions: true
-  beta: 0.0

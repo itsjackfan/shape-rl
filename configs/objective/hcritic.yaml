@@ -1,0 +1,12 @@
+# Learned-critic baseline (H2): the same hook and advantage as hvalue, but V = an MLP value head (ssl B3) refit online in
+# full, no contrastive geometry.
+defaults: [_base, _self_]
+estimator:
+  _target_: shape_rl.advantage.HiddenValue
+  init: ${output_root}/rl-ready/b3-head/head_seed0.pt  # `launch.py ssl estimator=b3 ablation=b3-head ssl.seeds=[0]` on branch rl-ready
+  train: all
+  lam: 0.95  # step-level credit: GAE over V(s_t) (lam = 1: r - V(s_t), a baseline only)
+  combine: replace
+trl:
+  num_generations: 2  # the method's claim: fewer full rollouts per prompt than GRPO's 8 (compare at equal FLOPs)
+  loss_type: dapo

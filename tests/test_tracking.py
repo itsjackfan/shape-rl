@@ -15,6 +15,8 @@ from shape_rl import tracking
         ("learning_rate", "optim/lr"),
         ("grad_norm", "optim/grad_norm"),
         ("epoch", "progress/epoch"),
+        ("num_tokens", "progress/num_tokens"),
+        ("flops", "progress/flops"),
         ("eval_loss", "test/loss"),
         ("eval_reward", "test/reward"),
         ("eval_math/mean_score", "test/math/mean_score"),
@@ -41,7 +43,7 @@ def test_logger_on_log(cfg_factory, tmp_path, monkeypatch):
     first, second = logged
     assert first["train/loss"] == 1.0 and first["optim/lr"] == 1e-6 and first["policy/kl"] == 0.1
     assert first["progress/step"] == 2
-    assert "num_tokens" not in first and "policy/num_tokens" not in first
+    assert first["progress/num_tokens"] == 100.0 and "policy/num_tokens" not in first
     assert second["perf/tokens_per_sec"] > 0 and second["perf/steps_per_sec"] > 0
     assert (tmp_path / "wandb_id").exists()
     logger.finish()

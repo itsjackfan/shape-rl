@@ -1,3 +1,4 @@
+defaults: [_head, _self_]
 # B1: entropy only: logistic regression on (entropy, logprob) of the prefix's last token.
 kind: scalar
-head: {lr: 1.0e-2, weight_decay: 1.0e-2, batch: 4096, max_epochs: 100, patience: 5}  # readout / regression head, early stop on val BCE
+head: {lr: 1.0e-2}  # higher lr for the 2-feature head

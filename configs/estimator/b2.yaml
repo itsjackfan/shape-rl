@@ -1,3 +1,3 @@
+defaults: [_head, _self_]
 # B2: linear probe (logistic) on frozen standardized h.
 kind: linear
-head: {lr: 3.0e-3, weight_decay: 1.0e-2, batch: 4096, max_epochs: 100, patience: 5}  # readout / regression head, early stop on val BCE

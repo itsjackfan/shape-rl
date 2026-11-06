@@ -2,27 +2,43 @@ import hydra
 from accelerate import PartialState
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
+from transformers import AutoTokenizer
 from transformers.trainer_utils import get_last_checkpoint
 from trl import GRPOConfig
 
 from shape_rl import data, paths
-from shape_rl.rewards import correctness
 from shape_rl.tracking import WandbLogger
 from shape_rl.trainer import ShapeTrainer
 
 
+def grpo_kwargs(cfg) -> dict:
+    """GRPOConfig kwargs as plain containers (GRPOConfig serializes them to JSON). Later sources win:
+    model.trl (vLLM sizing) < train < objective.trl."""
+    c = lambda x: OmegaConf.to_container(x, resolve=True) if x is not None else {}
+    return {**c(cfg.model.get("trl")), **c(cfg.train), **c(cfg.objective.trl)}
+
+
+def train_dataset(cfg):
+    """Train prompts whose chat-templated length is <= max_prompt_len tokens (the rule of rollout.py)."""
+    tok, kw = AutoTokenizer.from_pretrained(cfg.model.path), OmegaConf.to_container(cfg.model.chat_template_kwargs)
+    ds = data.load_train(cfg.data.train)
+    return ds.filter(lambda x: len(tok.apply_chat_template(x["prompt"], add_generation_prompt=True, tokenize=True, **kw))
+                     <= cfg.max_prompt_len)
+
+
 def run(cfg):
-    paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
+    paths.guard(cfg)
     out, state = paths.run_dir(cfg), PartialState()
     if state.is_main_process:
         paths.job_dir(out)
         OmegaConf.save(cfg, out / "config.yaml", resolve=True)
     state.wait_for_everyone()
 
-    args = GRPOConfig(output_dir=str(out), run_name=f"{cfg.exp}/{cfg.ablation}", report_to="none", seed=cfg.seed,
-                      **cfg.objective.trl, **cfg.train)
-    trainer = ShapeTrainer(model=cfg.model.path, reward_funcs=[correctness], args=args,
-                           train_dataset=data.load_train(cfg.data.train), estimator=instantiate(cfg.objective.estimator))
+    args = GRPOConfig(output_dir=str(out), run_name=f"{cfg.exp}/{cfg.ablation}", report_to="none", seed=cfg.seed, **grpo_kwargs(cfg))
+    budget = OmegaConf.to_container(cfg.budget, resolve=True)
+    trainer = ShapeTrainer(model=cfg.model.path, reward_funcs=[instantiate(r) for r in cfg.objective.rewards.values()], args=args,
+                           train_dataset=train_dataset(cfg), estimator=instantiate(cfg.objective.estimator),
+                           dynamic_sampling=cfg.objective.dynamic_sampling, budget=budget)
     logger = WandbLogger(cfg, out) if state.is_main_process else None
     if logger:
         trainer.add_callback(logger)

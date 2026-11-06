@@ -1,24 +1,31 @@
 defaults:
   - base
-  - model: qwen3.6-27b
+  - model: qwen3.5-4b
   - objective: grpo
   - data/train: [gsm8k, math]
   - _self_
 
-# Passed verbatim to trl.GRPOConfig (merged with objective.trl).
+max_prompt_len: 1024  # train prompts with a longer chat-templated prompt are dropped (rollout.max_prompt_len)
+budget:  # compute matching: model FLOPs of the training process (shape_rl.flops; logged as progress/flops)
+  max_flops: null  # stop when the count reaches this; null = stop by train.max_steps / epochs only
+  save_every_flops: null  # also save a checkpoint each time the count crosses a multiple of this (evals at equal FLOPs)
+
+# Passed to trl.GRPOConfig (model.trl < train < objective.trl).
 train:
   learning_rate: 1.0e-6
   lr_scheduler_type: constant
   num_train_epochs: 1
   max_steps: -1
   per_device_train_batch_size: 8
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 8  # 64 completions per GPU per optimizer step = 8 prompts x 8 generations
   num_generations: 8
-  max_completion_length: 2048
+  max_completion_length: ${model.max_new_tokens}
+  chat_template_kwargs: ${model.chat_template_kwargs}
   temperature: 1.0
   bf16: true
   gradient_checkpointing: true
   logging_steps: 1
   save_steps: 100
-  use_vllm: false
+  use_vllm: false  # cluster/run.sbatch sets true
   vllm_mode: colocate
+  vllm_max_model_length: ${add:${max_prompt_len},${model.max_new_tokens}}

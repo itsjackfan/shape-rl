@@ -1,5 +1,4 @@
-estimator: null  # null = TRL's built-in group-relative advantage
+defaults: [_base, _self_]
 trl:
   loss_type: grpo
   scale_rewards: group
-  beta: 0.0

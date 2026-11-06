@@ -53,8 +53,7 @@ def scalar_feats(idx, S):
                      np.concatenate([idx.logprob_prev.values[:, None], lp], 1)], -1)  # [N, S, 2]
 
 
-def mlp(d_in, d_hid, d_out):
-    return nn.Sequential(nn.Linear(d_in, d_hid), nn.GELU(), nn.Dropout(0.1), nn.Linear(d_hid, d_out))
+from shape_rl.advantage import mlp  # noqa: E402  (one head layout for ssl.py and RL: advantage.ValueHead)
 
 
 def fit_head(x_tr, y_tr, w_tr, x_va, y_va, w_va, E, hidden):
@@ -167,7 +166,7 @@ def fit_projection(X_NSD, data, E, seed):
         if step % 250 == 0:
             print(f"[ssl] {E.loss} step {step} loss {loss.item():.4f}", flush=True)
     g_net.eval()
-    return lambda x: F.normalize(g_net(x), dim=-1)
+    return g_net
 
 
 def kmeans(x, K, iters, seed):
@@ -191,13 +190,14 @@ def estimate(data, E, seed):
     idx, X_NSD, y_NS, w_NS, tr, va = data["idx"], data["X"], data["y"], data["w"], data["tr"], data["va"]
     torch.manual_seed(seed)
     if E.kind == "pass_rate":  # B0: GRPO's per-prompt baseline, the same value for every prefix of a prompt
-        return np.repeat(idx.pass_rate.values[:, None], X_NSD.shape[1], 1)
+        return np.repeat(idx.pass_rate.values[:, None], X_NSD.shape[1], 1), None
     if E.kind == "scalar":  # B1: entropy and logprob only
         X_NSD = data["scalar"]
     if E.kind in ("scalar", "linear", "mlp"):
         Xin = X_NSD
     else:  # contrastive projection, then a fixed readout
-        g = fit_projection(X_NSD, data, E, seed)
+        g_net = fit_projection(X_NSD, data, E, seed)
+        g = lambda x: F.normalize(g_net(x), dim=-1)
         with torch.no_grad():
             Xin = torch.cat([g(x) for x in X_NSD.flatten(0, 1).split(65536)]).view(*X_NSD.shape[:2], -1)
     if E.kind == "kmeans":  # C3: cluster-mean value
@@ -209,10 +209,17 @@ def estimate(data, E, seed):
         prior = (y_NS[tr] * w_NS[tr]).sum() / w_NS[tr].sum()
         val = (num + prior) / (den + 1)  # one pseudo-count at the train mean
         a = torch.cat([torch.cdist(x, c).argmin(1) for x in Xin.flatten(0, 1).split(65536)])
-        return val[a].view(Xin.shape[:2]).cpu().numpy()
+        return val[a].view(Xin.shape[:2]).cpu().numpy(), None
     hidden = E.hidden if E.kind == "mlp" else 0
     net = fit_head(Xin[tr], y_NS[tr], w_NS[tr], Xin[va], y_NS[va], w_NS[va], E.head, hidden)
-    return predict(net, Xin).cpu().numpy()
+    head = None
+    if E.kind != "scalar":  # the RL head (advantage.ValueHead layout): standardization, projection, readout
+        sd = {"mu": data["mu"].cpu(), "sd": data["sd"].cpu(), **{f"readout.{k}": v.cpu() for k, v in net.state_dict().items()}}
+        if E.kind == "contrastive":
+            sd.update({f"proj.{k}": v.cpu() for k, v in g_net.state_dict().items()})
+        head = {"D": X_NSD.shape[-1], "proj": OmegaConf.to_container(E.proj) if E.kind == "contrastive" else None,
+                "hidden": hidden, "state_dict": sd}
+    return predict(net, Xin).cpu().numpy(), head
 
 
 # ---- metrics on held-out prompts
@@ -262,6 +269,7 @@ def metrics(p_NS, data, test):
     A_mc, A_pr = (R[:, 1:] - R[:, :1]), (p[:, 1:] - p[:, :1])
     m = ~np.isnan(A_mc)
     out["spearman_A"] = float(spearmanr(A_pr[m], A_mc[m])[0]) if A_pr[m].std() > 0 else float("nan")
+    out["pearson_A"] = float(np.corrcoef(A_pr[m], A_mc[m])[0, 1]) if A_pr[m].std() > 0 else float("nan")
     Zp = np.concatenate([np.repeat(conf[:, None], A_mc.shape[1], 1), data["trunc_q"][test][..., None]], -1)[m]
     ra, rm = residual(pd.Series(A_pr[m]).rank().values, Zp), residual(pd.Series(A_mc[m]).rank().values, Zp)
     out["spearman_A_resid"] = float(np.corrcoef(ra, rm)[0, 1]) if A_pr[m].std() > 0 else float("nan")
@@ -280,14 +288,19 @@ def metrics(p_NS, data, test):
     return out
 
 
-def ceiling(data, test, n_splits=20, seed=0):
-    """Noise ceiling from split halves of the M continuations (Spearman-Brown corrected to M): reliability r of A_MC, Q_MC, dQ;
-    ceiling for Spearman(A) = sqrt(r_A); for sign accuracy, the accuracy of the true sign against M-sample labels implied by the
-    split-half sign agreement (symmetric noise); for AUROC, the AUROC of the MC estimate V_MC itself."""
-    o, idx = data["o"][test], data["idx"][test]
+def ceiling(data, test, prompt_ids=None, n_splits=20, seed=0):
+    """Noise ceilings from split halves of the M continuations (Spearman-Brown corrected to M). Reliability r of A_MC, Q_MC,
+    dQ (Spearman, and Pearson for A). Ceiling for Pearson(A) = sqrt(r_A, Pearson) (exact under classical test theory);
+    sqrt(r_A, Spearman) for Spearman(A) is an approximation (above the oracle value in simulation). sign_acc_halfM = the
+    accuracy of the true sign against M/2-sample labels, from the split-half sign agreement (symmetric noise, equal effect
+    sizes); it is not a bound at M. mc_ref_*: scores of the M-sample estimate V_MC itself (references, not upper bounds)."""
+    rows = np.nonzero(test)[0] if np.asarray(test).dtype == bool else np.asarray(test)
+    o, idx = data["o"][rows], data["idx"].iloc[rows]
+    if prompt_ids is not None:
+        idx = idx.assign(prompt_id=prompt_ids)
     rng = np.random.default_rng(seed)
     M = o.shape[-1]
-    r = {"A": [], "Q": [], "dQ": [], "agree": []}
+    r = {"A": [], "Q": [], "dQ": [], "agree": [], "A_pearson": []}
     for _ in range(n_splits):
         perm = rng.permutation(M)
         h1, h2 = o[..., perm[:M // 2]], o[..., perm[M // 2:]]
@@ -296,19 +309,38 @@ def ceiling(data, test, n_splits=20, seed=0):
             a, b = f(R1).ravel(), f(R2).ravel()
             m = ~np.isnan(a) & ~np.isnan(b)
             r[k].append(spearmanr(a[m], b[m])[0])
+            if k == "A":
+                r["A_pearson"].append(np.corrcoef(a[m], b[m])[0, 1])
         a, b = (R1[:, 2:] - R1[:, 1:2]).ravel(), (R2[:, 2:] - R2[:, 1:2]).ravel()
         m = ~np.isnan(a) & ~np.isnan(b) & (a != 0) & (b != 0)
         r["agree"].append(np.mean(np.sign(a[m]) == np.sign(b[m])))
     sb = lambda x: 2 * x / (1 + x)
     rel = {k: float(sb(np.mean(v))) for k, v in r.items() if k != "agree"}
     agree = float(np.mean(r["agree"]))
-    R = data["rate"][test]
+    R = data["rate"][rows]
     m = ~np.isnan(R[:, 0])
-    return {"reliability_A": rel["A"], "reliability_Q": rel["Q"], "reliability_dQ": rel["dQ"],
-            "spearman_A": float(np.sqrt(max(rel["A"], 0))), "sign_acc_halfM": float((1 + np.sqrt(max(2 * agree - 1, 0))) / 2),
-            "sign_agree_halves": agree,
-            "auroc": auroc_within(R[m, 0], idx.reward.values[m], idx.prompt_id.values[m]),
-            "succ_pcorr": partial_corr(R[m, 0], idx.reward.values[m].astype(float), np.zeros((m.sum(), 0)), idx.prompt_id.values[m])}
+    return {"reliability_A": rel["A"], "reliability_A_pearson": rel["A_pearson"], "reliability_Q": rel["Q"],
+            "reliability_dQ": rel["dQ"], "pearson_A": float(np.sqrt(max(rel["A_pearson"], 0))),
+            "spearman_A_approx": float(np.sqrt(max(rel["A"], 0))),
+            "sign_acc_halfM": float((1 + np.sqrt(max(2 * agree - 1, 0))) / 2), "sign_agree_halves": agree,
+            "mc_ref_auroc": auroc_within(R[m, 0], idx.reward.values[m], idx.prompt_id.values[m]),
+            "mc_ref_succ_pcorr": partial_corr(R[m, 0], idx.reward.values[m].astype(float), np.zeros((m.sum(), 0)),
+                                              idx.prompt_id.values[m])}
+
+
+def ceiling_ci(data, test, n_boot, seed=0):
+    """95 % percentile intervals of the ceilings over resamples of the test prompts (with replacement; a prompt drawn twice
+    counts as two prompts)."""
+    rng, idx = np.random.default_rng(seed), data["idx"]
+    rows = {p: np.nonzero(test & (idx.prompt_id == p).values)[0] for p in idx.prompt_id[test].unique()}
+    keys, boots = list(rows), []
+    for _ in range(n_boot):
+        draw = rng.choice(len(keys), len(keys))
+        sel = np.concatenate([rows[keys[k]] for k in draw])
+        labels = np.concatenate([np.full(len(rows[keys[k]]), j) for j, k in enumerate(draw)])
+        boots.append(ceiling(data, sel, labels))
+    return {k: [float(np.nanpercentile([b[k] for b in boots], 2.5)), float(np.nanpercentile([b[k] for b in boots], 97.5))]
+            for k in boots[0]}
 
 
 def prepare(cfg):
@@ -327,7 +359,7 @@ def prepare(cfg):
     item = lambda rows: torch.as_tensor(rows[:, None] & lab, device=DEV)
     tr_i, va_i = item(tr_rows), item(va_rows)
     data = {"idx": idx, "X": X, "y": y.to(DEV), "w": w.to(DEV), "tr": tr_i, "va": va_i, "o": o, "fin": fin, "rate": rate(succ, fin),
-            "scalar": torch.as_tensor(sc, dtype=torch.float32, device=DEV)}
+            "scalar": torch.as_tensor(sc, dtype=torch.float32, device=DEV), "mu": mu, "sd": sd}
     trunc = (o == -1).mean(-1)
     data["conf"] = np.c_[idx.t.values, idx.trace_len.values, idx.t.values / idx.trace_len.values, trunc[:, 0]]
     data["trunc_q"] = trunc[:, 1:]
@@ -337,6 +369,7 @@ def prepare(cfg):
     traj = []
     for tid, g in idx[tr_rows].groupby("trace_id"):
         st = sorted([(p - 1, i, 0) for i, p in zip(g.index, g.pos)] + [(p, i, 1) for i, p in zip(g.index, g.pos)])
+        st = [x for k, x in enumerate(st) if k == 0 or x[0] != st[k - 1][0]]  # branch points t, t+1 share a state: keep one
         traj.append((code[g.index[0]], [(i, s) for _, i, s in st]))
     data["traj"] = traj
     # C1: labelled train items per prompt with their success-rate bucket
@@ -355,17 +388,20 @@ def prepare(cfg):
 
 
 def run(cfg):
-    paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
+    paths.guard(cfg)
     out = paths.job_dir(paths.run_dir(cfg))
     OmegaConf.save(cfg, out / "config.yaml", resolve=True)
     data = prepare(cfg)
     test, val = ((data["idx"].split == s).values for s in ("test", "val"))
-    res = {"ceiling": ceiling(data, test), "seeds": {}, "val_seeds": {}}  # val: model choices (C3's representation)
+    res = {"ceiling": ceiling(data, test), "ceiling_ci95": ceiling_ci(data, test, cfg.ssl.ceiling_boot),
+           "seeds": {}, "val_seeds": {}}  # val: model choices (C3's representation)
     for seed in cfg.ssl.seeds:
         t0 = time.time()
-        p_NS = estimate(data, cfg.estimator, seed)
+        p_NS, head = estimate(data, cfg.estimator, seed)
         res["seeds"][seed], res["val_seeds"][seed] = metrics(p_NS, data, test), metrics(p_NS, data, val)
         np.save(out / f"pred_seed{seed}.npy", p_NS.astype(np.float32))
+        if head is not None:  # the RL estimator's starting head (advantage.HiddenValue init)
+            torch.save(head, out / f"head_seed{seed}.pt")
         print(f"[ssl] {cfg.ablation} seed {seed}: {res['seeds'][seed]} ({time.time() - t0:.0f}s)", flush=True)
     keys = next(iter(res["seeds"].values())).keys()
     res["mean"] = {k: float(np.mean([s[k] for s in res["seeds"].values()])) for k in keys}
@@ -373,8 +409,9 @@ def run(cfg):
     res["val_mean"] = {k: float(np.mean([s[k] for s in res["val_seeds"].values()])) for k in keys}
     (out / "metrics.json").write_text(json.dumps(res, indent=2))
     logger = WandbLogger(cfg, out)
-    logger.log({**{f"test/{k}": v for k, v in res["mean"].items()}, **{f"test/ceiling/{k}": v for k, v in res["ceiling"].items()},
-                "test/step": 0})
+    ceil = {f"test/{'mc_ref' if k.startswith('mc_ref') else 'ceiling'}/{k.removeprefix('mc_ref_')}": v
+            for k, v in res["ceiling"].items()}
+    logger.log({**{f"test/{k}": v for k, v in res["mean"].items()}, **ceil, "test/step": 0, "test/flops": 0.0})
     logger.finish()
     return res
 

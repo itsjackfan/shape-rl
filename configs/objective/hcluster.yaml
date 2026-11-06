@@ -1,0 +1,11 @@
+# GiGPO / BiPACE-style baseline: episode advantage + step advantage within hidden-state clusters of step-start states
+# (BiPACE's state grouping; its action-conditioned baseline and GiGPO's exact-state hashing do not apply to single-turn text).
+defaults: [_base, _self_]
+estimator:
+  _target_: shape_rl.advantage.HiddenCluster
+  model_path: ${model.path}
+  tau: 0.9
+  omega: 1.0
+trl:
+  loss_type: dapo
+  scale_rewards: group

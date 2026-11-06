@@ -1,7 +1,6 @@
+defaults: [_head, _self_]
 # C1: supervised contrastive (positives = same-prompt states in the same success-rate bucket); linear readout on z.
 kind: contrastive
 loss: bucket
 buckets: 4
 per_prompt: 16
-proj: {hidden: 512, dim: 128, lr: 1.0e-3, weight_decay: 1.0e-4, steps: 1500, batch: 512, tau: 0.1}  # z = g(h)
-head: {lr: 3.0e-3, weight_decay: 1.0e-2, batch: 4096, max_epochs: 100, patience: 5}  # readout / regression head, early stop on val BCE

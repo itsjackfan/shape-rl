@@ -30,14 +30,20 @@ def test_evaluate_mocked(cfg_factory, monkeypatch):
     assert (evaluate.eval_dir(cfg) / "results.json").exists()
 
 
+SMOKE = {"noop": [], "dapo": [], "hcluster": [],
+         "hvalue": ["objective.estimator.init=null", "+objective.estimator.kind=mlp", "+objective.estimator.hidden=8",
+                    "objective.estimator.train=all"]}
+
+
 @pytest.mark.slow
-def test_train_smoke(cfg_factory, monkeypatch):
+@pytest.mark.parametrize("objective", list(SMOKE))
+def test_train_smoke(cfg_factory, monkeypatch, objective):
     rows = {"prompt": [[{"role": "user", "content": f"{i}+1?"}] for i in range(4)], "answer": ["1"] * 4, "suite": ["math"] * 4}
     monkeypatch.setattr("shape_rl.data.load_train", lambda _: datasets.Dataset.from_dict(rows))
-    cfg = cfg_factory(overrides=["model=tiny", "objective=noop", "train.max_steps=1", "train.per_device_train_batch_size=4",
-                                 "train.num_generations=2", "train.max_completion_length=8", "train.bf16=false",
-                                 "train.gradient_checkpointing=false"])
+    cfg = cfg_factory(overrides=["model=tiny", f"objective={objective}", "train.max_steps=1", "train.per_device_train_batch_size=4",
+                                 "train.gradient_accumulation_steps=1", "train.num_generations=2", "train.bf16=false",
+                                 "train.gradient_checkpointing=false", *SMOKE[objective]])
     trainer = train.run(cfg)
     hist = trainer.state.log_history
-    assert trainer.state.global_step == 1
-    assert any("math/mean_score" in h for h in hist)
+    assert trainer.state.global_step == 1 and trainer.flops_total > 0
+    assert any("math/mean_score" in h for h in hist) and any("flops" in h for h in hist)

@@ -1,5 +1,4 @@
-estimator: null
+defaults: [_base, _self_]
 trl:
   loss_type: dr_grpo
   scale_rewards: none
-  beta: 0.0

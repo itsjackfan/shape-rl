@@ -111,7 +111,7 @@ def encode_pending(cfg, out, model, device):
 
 def run(cfg):
     """encode.follow: keep encoding new chunks while the rollout runs, until rollout/STOP exists (then a last pass)."""
-    paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
+    paths.guard(cfg)
     out = paths.run_dir(cfg)
     assert OmegaConf.load(out / "config.yaml").model.path == cfg.model.path, "encode with the rollout's model"
     (out / "states").mkdir(exist_ok=True)

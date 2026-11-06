@@ -1,5 +1,6 @@
-exp: ${git_branch:}
+exp: ${git_branch:}  # cluster/launch.py passes exp=<branch> so that a requeued job keeps it
 ablation: ???
+code: null  # cluster/launch.py passes the code hash (paths.code_hash); a requeued job refuses changed code
 output_root: ${oc.env:SHAPE_RL_OUTPUT_ROOT,outputs}
 log_path: EXPERIMENT_LOG.md
 seed: 0

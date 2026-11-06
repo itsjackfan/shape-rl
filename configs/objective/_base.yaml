@@ -1,0 +1,7 @@
+# Shared by every objective (Hydra defaults). estimator: null = TRL's built-in group-relative advantage.
+estimator: null
+dynamic_sampling: null
+rewards:  # reward functions, in TRL's order; `correctness` is the task score (mean_score, dynamic sampling)
+  correctness: {_target_: shape_rl.rewards.Correctness, model_path: "${model.path}"}
+trl:
+  beta: 0.0

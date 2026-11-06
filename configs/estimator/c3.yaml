@@ -1,3 +1,4 @@
+defaults: [_head, _self_]
 # C3: k-means on z from the best contrastive loss (set loss: after C0-C2 val results), cluster-mean value as the estimator.
 kind: kmeans
 loss: pairs
@@ -6,4 +7,3 @@ buckets: 4
 per_prompt: 16
 clusters: 64
 kmeans_iters: 50
-proj: {hidden: 512, dim: 128, lr: 1.0e-3, weight_decay: 1.0e-4, steps: 1500, batch: 512, tau: 0.1}  # z = g(h)

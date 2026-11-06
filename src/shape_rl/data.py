@@ -18,11 +18,11 @@ def gsm8k(split="train"):
 
 
 def math(split="train"):
-    """Gold = last \\boxed{} of the solution; rows without one are dropped."""
+    """Gold = last \\boxed answer of the solution; rows without one (or with an empty one) are dropped."""
     ds = datasets.load_dataset("DigitalLearningGmbH/MATH-lighteval", split=split)
     ds = ds.map(lambda x: {"prompt": _chat(x["problem"]), "answer": last_boxed(x["solution"]), "suite": "math"},
                 remove_columns=ds.column_names)
-    return ds.filter(lambda x: x["answer"] is not None)
+    return ds.filter(lambda x: bool(x["answer"]))
 
 
 def load_train(train_cfg) -> datasets.Dataset:

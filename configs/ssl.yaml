@@ -7,3 +7,4 @@ defaults:
 ssl:
   data: cf-data/full  # dataset dir <exp>/<ablation> under output_root (index.parquet + states/)
   seeds: [0, 1, 2]
+  ceiling_boot: 100  # prompt resamples for the 95 % intervals of the noise ceilings

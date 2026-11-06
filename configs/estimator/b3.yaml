@@ -1,4 +1,5 @@
+defaults: [_head, _self_]
 # B3: MLP value head on frozen h, regressed on the MC success rates of V and Q states (the learned critic).
 kind: mlp
 hidden: 512
-head: {lr: 1.0e-3, weight_decay: 1.0e-2, batch: 4096, max_epochs: 100, patience: 5}  # readout / regression head, early stop on val BCE
+head: {lr: 1.0e-3}

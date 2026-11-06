@@ -9,16 +9,19 @@ Built on TRL `GRPOTrainer` (pinned dependency, subclassed — not vendored). Run
 ```
 configs/              Hydra. train.yaml, eval.yaml share base.yaml
   model/              one yaml per model (path for from_pretrained)
-  objective/          estimator (_target_ or null = TRL built-in) + trl: GRPOConfig kwargs
+  objective/          estimator (_target_ or null = TRL built-in), rewards, dynamic_sampling + trl: GRPOConfig kwargs
+                      (_base.yaml shared; grpo, dr_grpo, dapo, noop; hvalue = the method, hcritic = MLP critic, hcluster = GiGPO/BiPACE-style)
+  lm_eval/            local lm-eval tasks (math500: minerva_math500 without its antlr4 4.11 check)
   data/train/         one yaml per train set (_target_ loader); enable via data/train=[a,b]
   data/eval/          one yaml per benchmark: lm-eval task, suite, primary metric
 src/shape_rl/
   paths.py            exp = git branch; run dir; never-overwrite; run guard
   tracking.py         the only WandB interface; fixed metric namespaces
   data.py             train loaders -> {prompt, answer, suite}
-  rewards.py          reward funcs (correctness = mean_score)
-  advantage.py        AdvantageEstimator base; one subclass per ablation
-  trainer.py          ShapeTrainer(GRPOTrainer): estimator hook + per-suite metrics
+  rewards.py          grade (last \boxed of a finished response) + Correctness (RL reward = grade; truncated = 0)
+  advantage.py        AdvantageEstimator base (observe hidden states, forward -> (n,) or (n, T)); one subclass per ablation
+  trainer.py          ShapeTrainer(GRPOTrainer): estimator + hidden-state hook, DAPO dynamic sampling, FLOP count/budget, per-suite metrics
+  flops.py            model FLOPs of the training process (the compute-matching axis)
   train.py, evaluate.py  Hydra entrypoints
 cluster/              launch.py (log gate, queue choice, sbatch), run.sbatch, zero3.yaml, setup.sh, hooks/post-commit
 tests/                shape + smoke tests (mocked hub/lm-eval; `-m slow` runs a tiny real GRPO step)
@@ -41,14 +44,14 @@ scripts/tmp_<exp>/    one-off scripts; delete once results are documented (ask f
    `uv run --env-file .env python cluster/launch.py eval ablation=<abl> ckpt=checkpoint-500`
    One job per launch; each ablation needs its own log line, dir and run.
 4. Run guard: train/eval refuse to start unless `EXPERIMENT_LOG.md` has `- YYYY-MM-DD HH:MM EST — <abl>: <what it tests>` under `## <exp>`. The user writes it.
-5. Outputs: `$SHAPE_RL_OUTPUT_ROOT/<exp>/<ablation>/` (default `outputs/`), never overwritten. WandB run `<exp>/<ablation>`, group `<exp>`; eval resumes the same run and logs `test/*` against `test/step`.
+5. Outputs: `$SHAPE_RL_OUTPUT_ROOT/<exp>/<ablation>/` (default `outputs/`), never overwritten. WandB run `<exp>/<ablation>`, group `<exp>`; evals log `test/*` into a second run `<exp>/<ablation>/eval` (same group) against `test/flops` (and `test/step`). Compute matching = equal `progress/flops` (training process only: generation, scoring and training passes, estimator; dataset building excluded); use `budget.max_flops` / `budget.save_every_flops`.
 6. Smoke/failed/test runs not needed for a writeup: once the user has processed results, remind them to delete; delete on approval.
 7. Done: success -> merge to main. Failure -> keep branch, push; the user adds an entry in main's log (branch, code changes, why it failed).
 
 ## Cluster
-- Queues: always `kempner_requeue` (account `kempner_ydu_lab`) or `gpu_requeue` (account `ydu_lab`; denies kempner accounts), whichever has the earlier `sbatch --test-only` start. `kempner_rtx` only when needed; keep it to a minimum.
+- Queues: always `kempner_requeue` (account `kempner_ydu_lab`) or `gpu_requeue` (account `ydu_lab`; denies kempner accounts), whichever has the earlier `sbatch --test-only` start. Other users set `SHAPE_RL_QUEUES` in `.env` (for example `kempner_requeue:kempner_krajan_lab`). `kempner_rtx` only when needed; keep it to a minimum.
 - `cluster/launch.py` picks the earliest (partition, account, GPU type) by `sbatch --test-only`; GPU types are >=80GB only (H200, H100, A100-80GB, RTX PRO 6000). `--rtx` adds `kempner_rtx`.
-- Requeue partitions preempt: a requeued job reuses its run dir (`paths.job_dir`) and resumes from the last checkpoint; up to `save_steps` of work is lost. SLURM logs append to `<output_root>/<exp>/slurm/`.
+- Requeue partitions preempt: a requeued job reuses its run dir (`paths.job_dir`) and resumes from the last checkpoint (with the FLOP count and the online estimator head: `shape_state.pt`); up to `save_steps` of work is lost. launch.py passes `exp=` and `code=<hash>`: a requeued job refuses changed code. SLURM logs append to `<output_root>/<exp>/slurm/`.
 - Code lives in git locally only. Every commit rsyncs the worktree to `fasrc:/n/holylabs/ydu_lab/Lab/jfan425/shape-rl/<branch>/` (`cluster/hooks/post-commit`, needs an open `ssh fasrc` ControlMaster; enable with `git config core.hooksPath cluster/hooks`). It writes `.gitinfo` (branch + commit), which gives `exp` on the cluster. Never edit code in these rsync mirrors. Exception: an agent running on the cluster works only in its own git clone (worktrees beside it, hook off) and pushes only when asked.
 - Once per synced worktree, and after dependency changes: `bash cluster/setup.sh` (uv sync with the `cluster` extra = vLLM + DeepSpeed; downloads `configs/model/*` weights). Jobs use `uv run --no-sync`.
 - `.env` (cluster only, never committed; see `.env.example`): WandB/HF tokens, `SHAPE_RL_OUTPUT_ROOT` on netscratch (purged: copy keepers to holylabs), `HF_HOME` = the shared lab cache `/n/netscratch/ydu_lab/Lab/jfan425/hf_cache` (same as dec-mas).

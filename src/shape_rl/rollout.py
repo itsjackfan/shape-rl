@@ -2,7 +2,7 @@
 
 Indexing. Response tokens r_0..r_{T-1} follow the prompt; `t` indexes the response, `pos = prompt_len + t` is absolute.
   s_t = prompt + r_<t is the state at branch point t; a_t = r_t is the sampled token;
-  a'  = the n_alt most likely tokens != a_t under pi(.|s_t) (stop tokens excluded); actions = [a_t, a'_1, ..., a'_k].
+  a'  = the n_alt most likely tokens != a_t under pi(.|s_t) (stop and special tokens excluded); actions = [a_t, a'_1, ..., a'_k].
   V(s_t)    <- M continuations sampled from s_t            (v_out).
   Q(s_t, a) <- M continuations sampled from s_t + a        (q_out, one block of M per action).
 Outcome codes: 1 / 0 = finished response graded by its last \\boxed{} (no box = 0); -1 = truncated (unknown, never a failure).
@@ -22,7 +22,7 @@ from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
 from shape_rl import paths
-from shape_rl.rewards import grade
+from shape_rl.rewards import grade, stop_ids
 
 
 def prompt_id(messages) -> str:
@@ -38,7 +38,7 @@ def topk_entropy(logprobs_K: np.ndarray) -> float:
     """Entropy of pi(.|s) from its top-K logprobs, the leftover mass as one outcome (a lower bound)."""
     p_K = np.exp(logprobs_K)
     rest = max(1.0 - p_K.sum(), 0.0)
-    return float(-(p_K * logprobs_K).sum() - (rest * np.log(rest) if rest > 0 else 0.0))
+    return float(-np.where(p_K > 0, p_K * logprobs_K, 0.0).sum() - (rest * np.log(rest) if rest > 0 else 0.0))  # 0 log 0 = 0
 
 
 def branch_points(H_T: np.ndarray, rng, n_entropy: int, n_random: int, q: float):
@@ -54,10 +54,10 @@ def branch_points(H_T: np.ndarray, rng, n_entropy: int, n_random: int, q: float)
     return ent, rnd
 
 
-def alternatives(top: dict, a_t: int, stop_ids, k: int) -> list[int]:
-    """The k most likely tokens != a_t that are not stop tokens. top: {token_id: (logprob, rank)}."""
+def alternatives(top: dict, a_t: int, excluded, k: int) -> list[int]:
+    """The k most likely tokens != a_t that are not in `excluded` (stop and special tokens). top: {token_id: (logprob, rank)}."""
     ranked = sorted(top.items(), key=lambda kv: kv[1][1])
-    return [tid for tid, _ in ranked if tid != a_t and tid not in stop_ids][:k]
+    return [tid for tid, _ in ranked if tid != a_t and tid not in excluded][:k]
 
 
 def select_traces(rewards, max_correct: int, max_incorrect: int) -> list[int]:
@@ -140,14 +140,9 @@ def write(df: pd.DataFrame, f: Path):
     tmp.rename(f)
 
 
-def stop_ids(tok, cfg) -> set:
-    from transformers import GenerationConfig
-
-    try:
-        eos = GenerationConfig.from_pretrained(cfg.model.path).eos_token_id
-    except OSError:  # no generation_config.json
-        eos = None
-    return {tok.eos_token_id, *(eos if isinstance(eos, list) else [eos])} - {None}
+def special_ids(tok) -> set:
+    """Special and added tokens (for example </think>, <|endoftext|>): never used as an alternative a'."""
+    return set(tok.all_special_ids) | set(tok.added_tokens_decoder)
 
 
 def sample_prompts(eng, tok, df, cfg, ck: Checkpoint) -> pd.DataFrame:
@@ -167,7 +162,7 @@ def sample_prompts(eng, tok, df, cfg, ck: Checkpoint) -> pd.DataFrame:
     return df.drop(columns=["messages"])
 
 
-def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, stops, ck: Checkpoint):
+def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, excluded, ck: Checkpoint):
     """Stages B + C for one chunk of kept prompts -> (one row per branch point, one row per branched trace).
     ck holds stage B (so a resumed chunk builds the same requests) and the graded outcomes of finished requests."""
     R, cap = cfg.rollout, cfg.model.max_new_tokens
@@ -184,7 +179,7 @@ def branch_chunk(eng, tok, chunk: pd.DataFrame, cfg, stops, ck: Checkpoint):
         rng = np.random.default_rng([cfg.seed, int(p.prompt_id, 16) % 2**32, k])
         for kind, ts in zip(("entropy", "random"), branch_points(H_T, rng, R.n_entropy, R.n_random, R.entropy_quantile)):
             for t in map(int, ts):  # numpy ints do not serialize into vLLM requests
-                acts = [r[t]] + alternatives(top_T[t], r[t], stops, R.n_alt)
+                acts = [r[t]] + alternatives(top_T[t], r[t], excluded, R.n_alt)
                 if len(acts) < 1 + R.n_alt:
                     continue
                 base = p.prompt_ids.tolist() + r[:t]
@@ -225,14 +220,14 @@ def check_config(out: Path, cfg):
 
 
 def run(cfg, engine=None):
-    paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
+    paths.guard(cfg)
     from transformers import AutoTokenizer
 
     out = paths.run_dir(cfg)
     (out / "rollout").mkdir(parents=True, exist_ok=True)
     check_config(out, cfg)
     tok, R = AutoTokenizer.from_pretrained(cfg.model.path), cfg.rollout
-    stops, eng = stop_ids(tok, cfg), engine
+    stops, eng = stop_ids(tok, cfg.model.path), engine
     pf = out / "rollout" / f"s{cfg.shard:03d}.prompts.parquet"
     if not pf.exists():
         eng = eng or Engine(cfg, stops)
@@ -249,7 +244,7 @@ def run(cfg, engine=None):
             continue
         eng = eng or Engine(cfg, stops)
         t0, ck = time.time(), Checkpoint(f.with_suffix(".ckpt"))
-        rows, traces = branch_chunk(eng, tok, kept.iloc[c * R.chunk_prompts:(c + 1) * R.chunk_prompts], cfg, stops, ck)
+        rows, traces = branch_chunk(eng, tok, kept.iloc[c * R.chunk_prompts:(c + 1) * R.chunk_prompts], cfg, stops | special_ids(tok), ck)
         write(traces, f.with_suffix(".traces.parquet"))
         write(rows, f)
         ck.f.unlink()

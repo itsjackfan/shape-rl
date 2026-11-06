@@ -1,13 +1,15 @@
 defaults:
   - base
-  - model: qwen3.6-27b
+  - model: qwen3.5-4b
   - data/eval: [gsm8k, math500, aime24, humaneval, mbpp, gpqa_diamond, arc_challenge]
   - _self_
 
 ckpt: null  # checkpoint dir name under the ablation's run dir (e.g. checkpoint-500); null = model.path as-is
 eval:
   backend: hf  # hf | vllm
-  model_args: dtype=bfloat16  # lm-eval model_args after pretrained=
+  # Model-level lm-eval args (after pretrained=): the train/rollout thinking mode; context = longest prompt + the cap.
+  model_args: dtype=bfloat16,enable_thinking=${model.chat_template_kwargs.enable_thinking},max_length=${add:${model.max_new_tokens},4096}
+  backend_args: ""  # backend-only args, appended (cluster/run.sbatch sets the vLLM ones)
+  gen_kwargs: max_gen_toks=${model.max_new_tokens}  # one response cap for every generative task (lm-eval default: 256)
   batch_size: auto
   limit: null
-  gen_kwargs: null

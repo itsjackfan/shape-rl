@@ -1,0 +1,14 @@
+# The proposal's method: V(s_t) from a head on the policy's last-layer state, used as a per-token baseline (no group mean).
+# Head = the offline contrastive estimator (ssl C2: projection z = g(h) + linear readout, chosen by val AUROC among C0-C2),
+# projection fixed, readout refit online on each batch's outcomes. A_t = GAE(lam) over V; 2 generations per prompt.
+# Ablations (one override each): objective.trl.num_generations=8 (equal rollouts), objective.estimator.lam=1.0 (baseline only).
+defaults: [_base, _self_]
+estimator:
+  _target_: shape_rl.advantage.HiddenValue
+  init: ${output_root}/rl-ready/c2-head/head_seed0.pt  # `launch.py ssl estimator=c2 ablation=c2-head ssl.seeds=[0]` on branch rl-ready
+  train: readout
+  lam: 0.95  # step-level credit: GAE over V(s_t) (lam = 1: r - V(s_t), a baseline only)
+  combine: replace
+trl:
+  num_generations: 2  # the method's claim: fewer full rollouts per prompt than GRPO's 8 (compare at equal FLOPs)
+  loss_type: dapo  # token-mean loss over the batch: the advantages are per token

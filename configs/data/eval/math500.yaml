@@ -1,4 +1,5 @@
 # @package data.eval.math500
-task: minerva_math500
+# configs/lm_eval/math500.yaml: lm-eval minerva_math500 without its antlr4 4.11 import check (hydra-core pins antlr4 4.9).
+task: shape_math500
 suite: math
 metric: "math_verify,none"

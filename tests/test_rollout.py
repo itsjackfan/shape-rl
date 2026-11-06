@@ -22,6 +22,10 @@ def test_last_boxed_and_grade():
     assert grade("so far 3 + 4 = 7", False, "7") == -1  # truncated: unknown, never a failure
 
 
+def test_topk_entropy_zero_prob():
+    assert np.isfinite(rollout.topk_entropy(np.array([0.0, -np.inf])))
+
+
 def test_topk_entropy():
     assert rollout.topk_entropy(np.log(np.full(4, 0.25))) == pytest.approx(np.log(4))
     p = np.array([0.5, 0.25])  # leftover 0.25 counts as one outcome
@@ -38,7 +42,7 @@ def test_branch_points():
 
 def test_alternatives_and_select():
     top = {5: (-0.1, 1), 7: (-2.0, 2), 2: (-3.0, 3), 9: (-4.0, 4)}
-    assert rollout.alternatives(top, a_t=5, stop_ids={7}, k=2) == [2, 9]
+    assert rollout.alternatives(top, a_t=5, excluded={7}, k=2) == [2, 9]
     assert rollout.select_traces([1, 0, -1, 1, 1, 0, 0], 2, 2) == [0, 3, 1, 5]
     assert rollout.split_of("ff", [70, 15, 15]) == rollout.split_of("ff", [70, 15, 15]) in {"train", "val", "test"}
 

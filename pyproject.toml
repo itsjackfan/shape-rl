@@ -13,7 +13,13 @@ dependencies = [
     "hydra-core>=1.3",
     "wandb>=0.19",
     "lm_eval==0.4.13",
-    "math-verify[antlr4_9_3]>=0.7",
+    "math-verify[antlr4_9_3]>=0.7",  # hydra-core 1.3 needs antlr4 4.9; MATH-500 eval uses configs/lm_eval (no 4.11 assert)
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "scipy",
+    "scikit-learn",
+    "safetensors",
     "einops>=0.8",
 ]
 

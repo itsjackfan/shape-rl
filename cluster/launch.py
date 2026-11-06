@@ -1,7 +1,10 @@
 """SLURM launcher, from the synced worktree on a login node:
 `uv run --env-file .env python cluster/launch.py train|eval|rollout|encode|ssl <hydra overrides> [--gpus N] [--rtx] [--time D-HH:MM:SS]
-[--queues partition:account[:gpu],...] [--shards N]`"""
+[--queues partition:account[:gpu],...] [--shards N]`
+Queues: --queues, else $SHAPE_RL_QUEUES (same format, set in .env), else QUEUES x GPUS. Every job gets exp=<branch> and
+code=<code hash> (a requeued job keeps its experiment name and refuses changed code)."""
 import argparse
+import os
 import re
 import subprocess
 import sys
@@ -52,13 +55,15 @@ def main(argv):
     parser.add_argument("--gpus", type=int, default=1)
     parser.add_argument("--rtx", action="store_true", help="also allow kempner_rtx (keep to a minimum)")
     parser.add_argument("--time", default="2-00:00:00")
-    parser.add_argument("--queues", default=None, help="partition:account[:gpu],... (default: QUEUES x GPUS)")
+    parser.add_argument("--queues", default=os.environ.get("SHAPE_RL_QUEUES") or None,
+                        help="partition:account[:gpu],... (default: $SHAPE_RL_QUEUES, else QUEUES x GPUS)")
     parser.add_argument("--shards", type=int, default=0, help="rollout/encode: submit N jobs with shard=i num_shards=N")
     parser.add_argument("--sbatch", default="", help="extra sbatch flags, e.g. '--cpus-per-gpu=8 --mem-per-gpu=64G'")
     args, overrides = parser.parse_known_args(argv)
     with initialize_config_dir(config_dir=str(ROOT / "configs"), version_base=None):
         cfg = compose(args.entry, overrides=overrides)
     paths.check_logged(cfg.log_path, cfg.exp, cfg.ablation)
+    overrides = [o for o in overrides if not o.startswith(("exp=", "code="))] + [f"exp={cfg.exp}", f"code={paths.code_hash()}"]
     logs = Path(cfg.output_root) / cfg.exp / "slurm"
     logs.mkdir(parents=True, exist_ok=True)
     qs = parse_queues(args.queues) if args.queues else None

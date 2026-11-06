@@ -1,6 +1,6 @@
 # Zero advantage: policy-gradient signal is off. Sanity baseline for the training loop.
+defaults: [_base, _self_]
 estimator:
   _target_: shape_rl.advantage.ZeroAdvantage
 trl:
   loss_type: grpo
-  beta: 0.0

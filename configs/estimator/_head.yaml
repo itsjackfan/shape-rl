@@ -1,0 +1,3 @@
+# Shared by the estimator configs (Hydra defaults): readout / regression head and contrastive projection settings.
+head: {lr: 3.0e-3, weight_decay: 1.0e-2, batch: 4096, max_epochs: 100, patience: 5}  # early stop on val BCE
+proj: {hidden: 512, dim: 128, lr: 1.0e-3, weight_decay: 1.0e-4, steps: 1500, batch: 512, tau: 0.1}  # z = g(h)

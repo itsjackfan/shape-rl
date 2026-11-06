@@ -18,7 +18,7 @@ if [ "$entry" = train ]; then
     -m shape_rl.train train.use_vllm=true "$@"
 elif [ "$entry" = eval ]; then
   uv run --no-sync --env-file .env python -m shape_rl.evaluate eval.backend=vllm \
-    "eval.model_args='dtype=bfloat16,tensor_parallel_size=$N,max_model_len=32768,gpu_memory_utilization=0.85'" "$@"
+    "eval.backend_args='tensor_parallel_size=$N,gpu_memory_utilization=0.85'" "$@"
 else  # rollout | encode | ssl: one GPU (ssl may run with --gpus 0), one shard
   uv run --no-sync --env-file .env python -m "shape_rl.$entry" "$@"
 fi

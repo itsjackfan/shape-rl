@@ -1,2 +1,3 @@
+defaults: [_head, _self_]
 # B0: per-prompt pass rate over the 8 oracle samples (GRPO's baseline); the same value for every prefix of a prompt.
 kind: pass_rate
