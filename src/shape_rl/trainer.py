@@ -20,6 +20,7 @@ from shape_rl.hidden import final_norm
 
 STATE_FILE = "shape_state.pt"  # FLOP count + estimator state; written after the rest of a checkpoint
 PROMPT_KEYS = ("prompt_ids", "prompt_mask")  # left-padded per generation round; other per-token keys are right-padded
+TOKEN_KEYS = ("prompt_ids", "completion_ids")  # padded with the pad token id
 
 
 def select_groups(keep_RG) -> list[tuple[int, int]]:
@@ -75,7 +76,8 @@ class ShapeTrainer(GRPOTrainer):
     # ---- FLOPs: scoring forwards (old logps, reference) are counted where they run; generation and training per batch
 
     def _get_per_token_logps_and_entropies(self, model, input_ids, attention_mask, logits_to_keep, batch_size=None, **kw):
-        self._n_scoring += self._scoring  # training forwards are counted in _count_batch
+        if self._scoring:  # training forwards are counted in _count_batch
+            self._n_scoring += 1
         if not self._scoring or self._capture is None or model is not self.model:
             return super()._get_per_token_logps_and_entropies(model, input_ids, attention_mask, logits_to_keep, batch_size, **kw)
         # hidden-state capture: each sub-batch forward hits the hook once, rows in order
@@ -230,7 +232,7 @@ class ShapeTrainer(GRPOTrainer):
             for k, v in o.items():
                 if not torch.is_tensor(v) or v.dim() == 0:
                     continue
-                fill = pad_id if k.endswith("_ids") else 0
+                fill = pad_id if k in TOKEN_KEYS else 0  # masks and multimodal token_type_ids: 0
                 if k in PROMPT_KEYS:
                     v = torch.nn.functional.pad(v, (P - v.shape[1], 0), value=fill)
                 elif k != "advantages" and v.dim() >= 2 and v.shape[1] == o["completion_ids"].shape[1] and v.shape[1] > 1:
