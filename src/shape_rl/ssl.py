@@ -3,7 +3,8 @@
 A prefix-value estimator f maps a state to P(success | prefix). For branch row i, slot 0 is h_v = h(s_t) and slot 1 + j is
 h_q[:, j] = h(s_t, a_j), so V_pred = f(slot 0), Q_pred(a_j) = f(slot 1 + j), A_pred = Q_pred - V_pred.
 Labels: success rate over finished continuations (truncated ones excluded), weight = number finished.
-Shapes: N = branch rows, S = 1 + A slots, D = state dim, Z = projection dim, I = labelled items (rows x slots), B = batch.
+Contrastive projections: contrastive.py. Metrics and noise ceilings: ssl_metrics.py.
+Shapes: N = branch rows, S = 1 + A slots, D = state dim, Z = projection dim, I = labelled items (rows x slots).
 """
 import json
 import time
@@ -16,18 +17,18 @@ import torch
 import torch.nn.functional as F
 from omegaconf import OmegaConf
 from safetensors.torch import load_file
-from scipy.stats import spearmanr
-from sklearn.metrics import roc_auc_score
 from torch import nn
 
-from shape_rl import paths
+from shape_rl import contrastive, paths
+from shape_rl.advantage import mlp
+from shape_rl.ssl_metrics import ceiling, ceiling_ci, metrics, rate
 from shape_rl.tracking import WandbLogger
 
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def load(d):
-    """-> index df, states h_NSD (bf16, index order), successes and finished counts [N, S]."""
+    """-> index df, states h_NSD (bf16, index order), successes and finished counts [N, S], outcome codes [N, S, M]."""
     idx = pd.read_parquet(d / "index.parquet")
     h = None
     for f, g in idx.groupby("states", sort=False):
@@ -40,20 +41,12 @@ def load(d):
     return idx, h, (o_NSM == 1).sum(-1), (o_NSM >= 0).sum(-1), o_NSM
 
 
-def rate(succ, fin):
-    with np.errstate(invalid="ignore", divide="ignore"):
-        return np.where(fin > 0, succ / fin, np.nan)
-
-
 def scalar_feats(idx, S):
     """B1 features per slot: entropy of the distribution that produced the prefix's last token and that token's logprob."""
     lp = np.stack(idx.action_logprobs.values)
     ent = np.repeat(idx.entropy.values[:, None], S - 1, 1)
     return np.stack([np.concatenate([idx.entropy_prev.values[:, None], ent], 1),
                      np.concatenate([idx.logprob_prev.values[:, None], lp], 1)], -1)  # [N, S, 2]
-
-
-from shape_rl.advantage import mlp  # noqa: E402  (one head layout for ssl.py and RL: advantage.ValueHead)
 
 
 def fit_head(x_tr, y_tr, w_tr, x_va, y_va, w_va, E, hidden):
@@ -81,94 +74,6 @@ def fit_head(x_tr, y_tr, w_tr, x_va, y_va, w_va, E, hidden):
     return net.eval()
 
 
-# ---- contrastive projections z = g(h), unit norm; each loss returns a scalar for one sampled batch
-
-
-def loss_trajectory(g, X_NSD, data, rng, E):
-    """C0, label-free InfoNCE: positive = the next on-trace state (by position) in the same trace; negatives = other prompts."""
-    tr = data["traj"]  # list of (prompt code, [(row, slot)] sorted by position), train traces only
-    pick = rng.choice(len(tr), E.proj.batch, replace=len(tr) < E.proj.batch)
-    a, p, pr = [], [], []
-    for k in pick:
-        code, st = tr[k]
-        u = rng.integers(len(st) - 1)
-        a.append(st[u]), p.append(st[u + 1]), pr.append(code)
-    a, p = torch.tensor(a, device=DEV), torch.tensor(p, device=DEV)
-    za, zp = g(X_NSD[a[:, 0], a[:, 1]]), g(X_NSD[p[:, 0], p[:, 1]])
-    pr = torch.tensor(pr, device=DEV)
-    logits = za @ zp.T / E.proj.tau
-    logits = logits.masked_fill((pr[:, None] == pr[None]) & ~torch.eye(len(pr), dtype=torch.bool, device=DEV), float("-inf"))
-    t = torch.arange(len(pr), device=DEV)
-    return (F.cross_entropy(logits, t) + F.cross_entropy(logits.T, t)) / 2
-
-
-def supcon(z, pos, valid, tau):
-    """Supervised contrastive loss: pos[i, j] marks positives of anchor i; valid[i, j] marks candidates (self excluded)."""
-    s = (z @ z.T / tau).masked_fill(~valid, float("-inf"))
-    logp = s - torch.logsumexp(s, 1, keepdim=True)
-    n = pos.sum(1)
-    keep = n > 0
-    if not keep.any():
-        return z.sum() * 0
-    return -(logp.masked_fill(~pos, 0).sum(1)[keep] / n[keep]).mean()
-
-
-def loss_bucket(g, X_NSD, data, rng, E):
-    """C1, supervised contrastive: positives = same-prompt labelled states in the same success-rate bucket."""
-    groups = data["prompt_items"]  # per train prompt: array of (row, slot, bucket)
-    n_p = max(1, E.proj.batch // E.per_prompt)
-    ps = rng.choice(len(groups), n_p, replace=len(groups) < n_p)
-    it = np.concatenate([groups[p][rng.choice(len(groups[p]), min(E.per_prompt, len(groups[p])), replace=False)] for p in ps])
-    code = torch.tensor(np.repeat(ps, [min(E.per_prompt, len(groups[p])) for p in ps]), device=DEV)
-    z = g(X_NSD[torch.as_tensor(it[:, 0], device=DEV), torch.as_tensor(it[:, 1], device=DEV)])
-    bucket = torch.as_tensor(it[:, 2], device=DEV)
-    eye = torch.eye(len(it), dtype=torch.bool, device=DEV)
-    return supcon(z, (code[:, None] == code[None]) & (bucket[:, None] == bucket[None]) & ~eye, ~eye, E.proj.tau)
-
-
-def loss_pairs(g, X_NSD, data, rng, E):
-    """C2, counterfactual pairs: anchor h(s_t, a_t); positives = replacements a' with |dQ| <= delta, hard negatives = |dQ| > delta;
-    anchors of rows from other prompts are extra negatives. Candidates are indexed [anchor b, row c, action j]."""
-    r = torch.as_tensor(rng.choice(data["pair_rows"], E.proj.batch, replace=False), device=DEV)
-    Bn, A = len(r), X_NSD.shape[1] - 1
-    z_BAZ = g(X_NSD[r, 1:].flatten(0, 1)).view(Bn, A, -1)  # action 0 = a_t
-    Q_BA, ok_BA, code = data["Q"][r], data["Qok"][r], data["code"][r]
-    own = torch.eye(Bn, dtype=torch.bool, device=DEV)[:, :, None]
-    alt = (torch.arange(A, device=DEV) > 0)[None, None]
-    lab = ok_BA[None] & ok_BA[:, None, :1]
-    dq = (Q_BA[None] - Q_BA[:, None, :1]).abs()
-    pos = own & alt & lab & (dq <= E.delta)
-    valid = (own & alt & lab) | ((code[:, None] != code[None])[:, :, None] & ~alt)
-    s = torch.einsum("bz,caz->bca", z_BAZ[:, 0], z_BAZ) / E.proj.tau
-    s = s.masked_fill(~valid, float("-inf")).flatten(1)
-    logp, pos = s - torch.logsumexp(s, 1, keepdim=True), pos.flatten(1)
-    n = pos.sum(1)
-    keep = n > 0
-    if not keep.any():
-        return z_BAZ.sum() * 0
-    return -(logp.masked_fill(~pos, 0).sum(1)[keep] / n[keep]).mean()
-
-
-LOSSES = {"trajectory": loss_trajectory, "bucket": loss_bucket, "pairs": loss_pairs}
-
-
-def fit_projection(X_NSD, data, E, seed):
-    """z = g(h): MLP, unit norm, trained by the estimator's contrastive loss (settings in E.proj)."""
-    g_net = mlp(X_NSD.shape[-1], E.proj.hidden, E.proj.dim).to(DEV)
-    g = lambda x: F.normalize(g_net(x), dim=-1)
-    opt = torch.optim.AdamW(g_net.parameters(), lr=E.proj.lr, weight_decay=E.proj.weight_decay)
-    rng = np.random.default_rng(seed)
-    for step in range(E.proj.steps):
-        opt.zero_grad()
-        loss = LOSSES[E.loss](g, X_NSD, data, rng, E)
-        loss.backward()
-        opt.step()
-        if step % 250 == 0:
-            print(f"[ssl] {E.loss} step {step} loss {loss.item():.4f}", flush=True)
-    g_net.eval()
-    return g_net
-
-
 def kmeans(x, K, iters, seed):
     gen = torch.Generator(device="cpu").manual_seed(seed)
     c = x[torch.randperm(len(x), generator=gen)[:K].to(x.device)].clone()
@@ -181,210 +86,73 @@ def kmeans(x, K, iters, seed):
 # ---- estimators: each returns p_NS, predicted P(success) for every row and slot
 
 
-def predict(net, X_NSD):
+def batched(fn, X_NSD):
+    """fn over all rows and slots in blocks of 65536 items -> [N, S, ...]."""
     with torch.no_grad():
-        return torch.cat([torch.sigmoid(net(x)[:, 0]) for x in X_NSD.flatten(0, 1).split(65536)]).view(X_NSD.shape[:2])
+        return torch.cat([fn(x) for x in X_NSD.flatten(0, 1).split(65536)]).view(*X_NSD.shape[:2], -1)
+
+
+def kmeans_value(z_NSZ, y_NS, w_NS, tr, E, seed):
+    """C3: k-means on the train items' z, value = cluster mean success (one pseudo-count at the train mean)."""
+    c = kmeans(z_NSZ[tr], E.clusters, E.kmeans_iters, seed)
+    a_tr = torch.cdist(z_NSZ[tr], c).argmin(1)
+    num = torch.zeros(E.clusters, device=DEV).index_add_(0, a_tr, y_NS[tr] * w_NS[tr])
+    den = torch.zeros(E.clusters, device=DEV).index_add_(0, a_tr, w_NS[tr])
+    prior = (y_NS[tr] * w_NS[tr]).sum() / w_NS[tr].sum()
+    return ((num + prior) / (den + 1))[batched(lambda x: torch.cdist(x, c).argmin(1), z_NSZ)[..., 0]]
+
+
+def head_spec(data, readout, g_net, E):
+    """The RL starting head (advantage.ValueHead layout: standardization, optional projection, readout)."""
+    sd = {"mu": data["mu"].cpu(), "sd": data["sd"].cpu(), **{f"readout.{k}": v.cpu() for k, v in readout.state_dict().items()}}
+    if g_net is not None:
+        sd.update({f"proj.{k}": v.cpu() for k, v in g_net.state_dict().items()})
+    return {"D": data["X"].shape[-1], "proj": OmegaConf.to_container(E.proj) if g_net is not None else None,
+            "hidden": E.hidden if E.kind == "mlp" else 0, "state_dict": sd}
 
 
 def estimate(data, E, seed):
-    idx, X_NSD, y_NS, w_NS, tr, va = data["idx"], data["X"], data["y"], data["w"], data["tr"], data["va"]
+    """-> (p_NS, RL head spec or None). B0 pass rate; B1 scalar features; B2/B3 linear/MLP head on h; C0-C2 contrastive
+    projection + linear readout; C3 k-means on the projection."""
     torch.manual_seed(seed)
     if E.kind == "pass_rate":  # B0: GRPO's per-prompt baseline, the same value for every prefix of a prompt
-        return np.repeat(idx.pass_rate.values[:, None], X_NSD.shape[1], 1), None
-    if E.kind == "scalar":  # B1: entropy and logprob only
-        X_NSD = data["scalar"]
-    if E.kind in ("scalar", "linear", "mlp"):
-        Xin = X_NSD
-    else:  # contrastive projection, then a fixed readout
-        g_net = fit_projection(X_NSD, data, E, seed)
-        g = lambda x: F.normalize(g_net(x), dim=-1)
-        with torch.no_grad():
-            Xin = torch.cat([g(x) for x in X_NSD.flatten(0, 1).split(65536)]).view(*X_NSD.shape[:2], -1)
-    if E.kind == "kmeans":  # C3: cluster-mean value
-        z_tr = Xin[tr]
-        c = kmeans(z_tr, E.clusters, E.kmeans_iters, seed)
-        a_tr = torch.cdist(z_tr, c).argmin(1)
-        num = torch.zeros(E.clusters, device=DEV).index_add_(0, a_tr, y_NS[tr] * w_NS[tr])
-        den = torch.zeros(E.clusters, device=DEV).index_add_(0, a_tr, w_NS[tr])
-        prior = (y_NS[tr] * w_NS[tr]).sum() / w_NS[tr].sum()
-        val = (num + prior) / (den + 1)  # one pseudo-count at the train mean
-        a = torch.cat([torch.cdist(x, c).argmin(1) for x in Xin.flatten(0, 1).split(65536)])
-        return val[a].view(Xin.shape[:2]).cpu().numpy(), None
-    hidden = E.hidden if E.kind == "mlp" else 0
-    net = fit_head(Xin[tr], y_NS[tr], w_NS[tr], Xin[va], y_NS[va], w_NS[va], E.head, hidden)
-    head = None
-    if E.kind != "scalar":  # the RL head (advantage.ValueHead layout): standardization, projection, readout
-        sd = {"mu": data["mu"].cpu(), "sd": data["sd"].cpu(), **{f"readout.{k}": v.cpu() for k, v in net.state_dict().items()}}
-        if E.kind == "contrastive":
-            sd.update({f"proj.{k}": v.cpu() for k, v in g_net.state_dict().items()})
-        head = {"D": X_NSD.shape[-1], "proj": OmegaConf.to_container(E.proj) if E.kind == "contrastive" else None,
-                "hidden": hidden, "state_dict": sd}
-    return predict(net, Xin).cpu().numpy(), head
-
-
-# ---- metrics on held-out prompts
-
-
-def ece(p, y, w, bins=10):
-    b = np.minimum((p * bins).astype(int), bins - 1)
-    W = np.bincount(b, w, bins)
-    gap = np.abs(np.bincount(b, w * p, bins) - np.bincount(b, w * y, bins))
-    return float(gap.sum() / W.sum())
-
-
-def residual(x, Z):
-    Z1 = np.c_[np.ones(len(Z)), (Z - Z.mean(0)) / (Z.std(0) + 1e-9)]
-    return x - Z1 @ np.linalg.lstsq(Z1, x, rcond=None)[0]
-
-
-def partial_corr(x, y, Z, groups):
-    """Correlation of x and y after removing per-group means (prompt fixed effects) and then a linear fit on Z from both."""
-    if len(x) < 3:
-        return float("nan")
-    code = pd.factorize(groups)[0]
-    D = np.c_[x, y, Z].astype(float)
-    mean = np.zeros((code.max() + 1, D.shape[1]))
-    np.add.at(mean, code, D)
-    d = D - (mean / np.bincount(code)[:, None])[code]
-    r = d[:, :2] - d[:, 2:] @ np.linalg.lstsq(d[:, 2:], d[:, :2], rcond=None)[0] if Z.shape[1] else d[:, :2]
-    return float(np.corrcoef(r[:, 0], r[:, 1])[0, 1]) if r[:, 0].std() > 1e-12 else float("nan")
-
-
-def auroc_within(score, label, prompt):
-    a = [roc_auc_score(label[m], score[m]) for p in np.unique(prompt) if len(np.unique(label[m := prompt == p])) == 2]
-    return float(np.mean(a))
-
-
-def metrics(p_NS, data, test):
-    """AUROC (trace success from V_pred at h(s_t), within prompt); succ_pcorr: within-prompt correlation of V_pred with
-    trace success, '_resid' with position, trace length, relative position and truncation regressed out of both;
-    Spearman(A_pred, A_MC) ('_resid': ranks of both residualized on the confounds); sign accuracy of Q(a') - Q(a_t) (pairs
-    share position and trace, so they need no confound control); ECE."""
-    idx, R, fin, conf = data["idx"][test], data["rate"][test], data["fin"][test], data["conf"][test]
-    p = p_NS[test]
-    y, g = idx.reward.values.astype(float), idx.prompt_id.values
-    out = {"auroc": auroc_within(p[:, 0], idx.reward.values, g),
-           "succ_pcorr": partial_corr(p[:, 0], y, np.zeros((len(y), 0)), g),  # within prompt
-           "succ_pcorr_resid": partial_corr(p[:, 0], y, (conf - conf.mean(0)) / (conf.std(0) + 1e-9), g)}  # and confounds out
-    A_mc, A_pr = (R[:, 1:] - R[:, :1]), (p[:, 1:] - p[:, :1])
-    m = ~np.isnan(A_mc)
-    out["spearman_A"] = float(spearmanr(A_pr[m], A_mc[m])[0]) if A_pr[m].std() > 0 else float("nan")
-    out["pearson_A"] = float(np.corrcoef(A_pr[m], A_mc[m])[0, 1]) if A_pr[m].std() > 0 else float("nan")
-    Zp = np.concatenate([np.repeat(conf[:, None], A_mc.shape[1], 1), data["trunc_q"][test][..., None]], -1)[m]
-    ra, rm = residual(pd.Series(A_pr[m]).rank().values, Zp), residual(pd.Series(A_mc[m]).rank().values, Zp)
-    out["spearman_A_resid"] = float(np.corrcoef(ra, rm)[0, 1]) if A_pr[m].std() > 0 else float("nan")
-    dq_mc, dq_pr = R[:, 2:] - R[:, 1:2], p[:, 2:] - p[:, 1:2]
-    m = ~np.isnan(dq_mc) & (dq_mc != 0)
-    hit = np.where(dq_pr == 0, 0.5, np.sign(dq_pr) == np.sign(dq_mc))
-    out["sign_acc"], out["n_sign_pairs"] = float(np.mean(hit[m])), int(m.sum())
-    for kind in ("entropy", "random"):  # by branch-point kind (H1 x H2)
-        k = (idx.kind.values == kind)[:, None]
-        out[f"sign_acc_{kind}"] = float(np.mean(hit[m & k]))
-        mk = ~np.isnan(A_mc) & k
-        out[f"spearman_A_{kind}"] = float(spearmanr(A_pr[mk], A_mc[mk])[0]) if A_pr[mk].std() > 0 else float("nan")
-    m = fin > 0
-    out["ece"] = ece(np.clip(p[m], 0, 1), R[m], fin[m])
-    out["n_test_prompts"] = int(idx.prompt_id.nunique())
-    return out
-
-
-def ceiling(data, test, prompt_ids=None, n_splits=20, seed=0):
-    """Noise ceilings from split halves of the M continuations (Spearman-Brown corrected to M). Reliability r of A_MC, Q_MC,
-    dQ (Spearman, and Pearson for A). Ceiling for Pearson(A) = sqrt(r_A, Pearson) (exact under classical test theory);
-    sqrt(r_A, Spearman) for Spearman(A) is an approximation (above the oracle value in simulation). sign_acc_halfM = the
-    accuracy of the true sign against M/2-sample labels, from the split-half sign agreement (symmetric noise, equal effect
-    sizes); it is not a bound at M. mc_ref_*: scores of the M-sample estimate V_MC itself (references, not upper bounds)."""
-    rows = np.nonzero(test)[0] if np.asarray(test).dtype == bool else np.asarray(test)
-    o, idx = data["o"][rows], data["idx"].iloc[rows]
-    if prompt_ids is not None:
-        idx = idx.assign(prompt_id=prompt_ids)
-    rng = np.random.default_rng(seed)
-    M = o.shape[-1]
-    r = {"A": [], "Q": [], "dQ": [], "agree": [], "A_pearson": []}
-    for _ in range(n_splits):
-        perm = rng.permutation(M)
-        h1, h2 = o[..., perm[:M // 2]], o[..., perm[M // 2:]]
-        R1, R2 = rate((h1 == 1).sum(-1), (h1 >= 0).sum(-1)), rate((h2 == 1).sum(-1), (h2 >= 0).sum(-1))
-        for k, f in (("A", lambda R: R[:, 1:] - R[:, :1]), ("Q", lambda R: R[:, 1:]), ("dQ", lambda R: R[:, 2:] - R[:, 1:2])):
-            a, b = f(R1).ravel(), f(R2).ravel()
-            m = ~np.isnan(a) & ~np.isnan(b)
-            r[k].append(spearmanr(a[m], b[m])[0])
-            if k == "A":
-                r["A_pearson"].append(np.corrcoef(a[m], b[m])[0, 1])
-        a, b = (R1[:, 2:] - R1[:, 1:2]).ravel(), (R2[:, 2:] - R2[:, 1:2]).ravel()
-        m = ~np.isnan(a) & ~np.isnan(b) & (a != 0) & (b != 0)
-        r["agree"].append(np.mean(np.sign(a[m]) == np.sign(b[m])))
-    sb = lambda x: 2 * x / (1 + x)
-    rel = {k: float(sb(np.mean(v))) for k, v in r.items() if k != "agree"}
-    agree = float(np.mean(r["agree"]))
-    R = data["rate"][rows]
-    m = ~np.isnan(R[:, 0])
-    return {"reliability_A": rel["A"], "reliability_A_pearson": rel["A_pearson"], "reliability_Q": rel["Q"],
-            "reliability_dQ": rel["dQ"], "pearson_A": float(np.sqrt(max(rel["A_pearson"], 0))),
-            "spearman_A_approx": float(np.sqrt(max(rel["A"], 0))),
-            "sign_acc_halfM": float((1 + np.sqrt(max(2 * agree - 1, 0))) / 2), "sign_agree_halves": agree,
-            "mc_ref_auroc": auroc_within(R[m, 0], idx.reward.values[m], idx.prompt_id.values[m]),
-            "mc_ref_succ_pcorr": partial_corr(R[m, 0], idx.reward.values[m].astype(float), np.zeros((m.sum(), 0)),
-                                              idx.prompt_id.values[m])}
-
-
-def ceiling_ci(data, test, n_boot, seed=0):
-    """95 % percentile intervals of the ceilings over resamples of the test prompts (with replacement; a prompt drawn twice
-    counts as two prompts)."""
-    rng, idx = np.random.default_rng(seed), data["idx"]
-    rows = {p: np.nonzero(test & (idx.prompt_id == p).values)[0] for p in idx.prompt_id[test].unique()}
-    keys, boots = list(rows), []
-    for _ in range(n_boot):
-        draw = rng.choice(len(keys), len(keys))
-        sel = np.concatenate([rows[keys[k]] for k in draw])
-        labels = np.concatenate([np.full(len(rows[keys[k]]), j) for j, k in enumerate(draw)])
-        boots.append(ceiling(data, sel, labels))
-    return {k: [float(np.nanpercentile([b[k] for b in boots], 2.5)), float(np.nanpercentile([b[k] for b in boots], 97.5))]
-            for k in boots[0]}
+        return np.repeat(data["idx"].pass_rate.values[:, None], data["X"].shape[1], 1), None
+    X, g_net = data["scalar"] if E.kind == "scalar" else data["X"], None
+    if E.kind in ("contrastive", "kmeans"):
+        g_net = contrastive.fit_projection(data["X"], data, E, seed)
+        X = batched(lambda x: F.normalize(g_net(x), dim=-1), data["X"])
+    y, w, tr, va = data["y"], data["w"], data["tr"], data["va"]
+    if E.kind == "kmeans":
+        return kmeans_value(X, y, w, tr, E, seed).cpu().numpy(), None
+    net = fit_head(X[tr], y[tr], w[tr], X[va], y[va], w[va], E.head, E.hidden if E.kind == "mlp" else 0)
+    p_NS = batched(lambda x: torch.sigmoid(net(x)[:, 0]), X)[..., 0].cpu().numpy()
+    return p_NS, None if E.kind == "scalar" else head_spec(data, net, g_net, E)
 
 
 def prepare(cfg):
+    """Standardized states, labels, train/val item masks, confounds and the contrastive sampling tables."""
     idx, h_NSD, succ, fin, o = load(Path(cfg.output_root) / cfg.ssl.data)
-    N, S = succ.shape
-    split = idx.split.values
-    tr_rows, va_rows = split == "train", split == "val"
-    w = torch.as_tensor(fin, dtype=torch.float32)
-    y = torch.as_tensor(np.nan_to_num(rate(succ, fin)), dtype=torch.float32)
-    lab = fin > 0
-    mu = h_NSD[torch.as_tensor(tr_rows)].float().flatten(0, 1).mean(0)
-    sd = h_NSD[torch.as_tensor(tr_rows)].float().flatten(0, 1).std(0) + 1e-4
-    X = ((h_NSD.to(DEV).float() - mu.to(DEV)) / sd.to(DEV))
-    sc = scalar_feats(idx, S)
+    tr_rows, va_rows = (idx.split.values == s for s in ("train", "val"))
+    h_tr = h_NSD[torch.as_tensor(tr_rows)].float().flatten(0, 1)
+    mu, sd = h_tr.mean(0), h_tr.std(0) + 1e-4
+    sc = scalar_feats(idx, h_NSD.shape[1])
     sc = (sc - sc[tr_rows].reshape(-1, 2).mean(0)) / sc[tr_rows].reshape(-1, 2).std(0)
-    item = lambda rows: torch.as_tensor(rows[:, None] & lab, device=DEV)
-    tr_i, va_i = item(tr_rows), item(va_rows)
-    data = {"idx": idx, "X": X, "y": y.to(DEV), "w": w.to(DEV), "tr": tr_i, "va": va_i, "o": o, "fin": fin, "rate": rate(succ, fin),
-            "scalar": torch.as_tensor(sc, dtype=torch.float32, device=DEV), "mu": mu, "sd": sd}
-    trunc = (o == -1).mean(-1)
-    data["conf"] = np.c_[idx.t.values, idx.trace_len.values, idx.t.values / idx.trace_len.values, trunc[:, 0]]
-    data["trunc_q"] = trunc[:, 1:]
+    item = lambda rows: torch.as_tensor(rows[:, None] & (fin > 0), device=DEV)
+    R, trunc = rate(succ, fin), (o == -1).mean(-1)
     code = pd.factorize(idx.prompt_id)[0]
-    data["code"] = torch.as_tensor(code, device=DEV)
-    # C0: on-trace states (h_v at pos - 1, h_q[a_t] at pos) of train traces, sorted by position
-    traj = []
-    for tid, g in idx[tr_rows].groupby("trace_id"):
-        st = sorted([(p - 1, i, 0) for i, p in zip(g.index, g.pos)] + [(p, i, 1) for i, p in zip(g.index, g.pos)])
-        st = [x for k, x in enumerate(st) if k == 0 or x[0] != st[k - 1][0]]  # branch points t, t+1 share a state: keep one
-        traj.append((code[g.index[0]], [(i, s) for _, i, s in st]))
-    data["traj"] = traj
-    # C1: labelled train items per prompt with their success-rate bucket
-    R = data["rate"]
-    data["prompt_items"] = []
-    for p, g in idx[tr_rows].groupby("prompt_id"):
-        ii, ss = np.nonzero(lab[g.index.values])
-        rows = g.index.values[ii]
-        nb = cfg.estimator.get("buckets", 4)
-        data["prompt_items"].append(np.c_[rows, ss, np.minimum((R[rows, ss] * nb).astype(int), nb - 1)])
-    # C2: train rows whose a_t is labelled
-    data["Q"] = torch.as_tensor(np.nan_to_num(R[:, 1:]), device=DEV)
-    data["Qok"] = torch.as_tensor(fin[:, 1:] > 0, device=DEV)
-    data["pair_rows"] = np.nonzero(tr_rows & (fin[:, 1] > 0))[0]
+    data = {"idx": idx, "X": (h_NSD.to(DEV).float() - mu.to(DEV)) / sd.to(DEV), "mu": mu, "sd": sd,
+            "y": torch.as_tensor(np.nan_to_num(R), dtype=torch.float32, device=DEV),
+            "w": torch.as_tensor(fin, dtype=torch.float32, device=DEV), "tr": item(tr_rows), "va": item(va_rows),
+            "o": o, "fin": fin, "rate": R, "scalar": torch.as_tensor(sc, dtype=torch.float32, device=DEV),
+            "conf": np.c_[idx.t.values, idx.trace_len.values, idx.t.values / idx.trace_len.values, trunc[:, 0]],
+            "trunc_q": trunc[:, 1:], "code": torch.as_tensor(code, device=DEV)}
+    data.update(contrastive.train_data(idx, tr_rows, R, fin, code, cfg.estimator.get("buckets", 4), DEV))
     return data
+
+
+def across_seeds(per_seed, fn):
+    """{metric: fn over seeds} from {seed: {metric: value}}."""
+    return {k: float(fn([m[k] for m in per_seed.values()])) for k in next(iter(per_seed.values()))}
 
 
 def run(cfg):
@@ -403,10 +171,8 @@ def run(cfg):
         if head is not None:  # the RL estimator's starting head (advantage.HiddenValue init)
             torch.save(head, out / f"head_seed{seed}.pt")
         print(f"[ssl] {cfg.ablation} seed {seed}: {res['seeds'][seed]} ({time.time() - t0:.0f}s)", flush=True)
-    keys = next(iter(res["seeds"].values())).keys()
-    res["mean"] = {k: float(np.mean([s[k] for s in res["seeds"].values()])) for k in keys}
-    res["std"] = {k: float(np.std([s[k] for s in res["seeds"].values()])) for k in keys}
-    res["val_mean"] = {k: float(np.mean([s[k] for s in res["val_seeds"].values()])) for k in keys}
+    res.update(mean=across_seeds(res["seeds"], np.mean), std=across_seeds(res["seeds"], np.std),
+               val_mean=across_seeds(res["val_seeds"], np.mean))
     (out / "metrics.json").write_text(json.dumps(res, indent=2))
     logger = WandbLogger(cfg, out)
     ceil = {f"test/{'mc_ref' if k.startswith('mc_ref') else 'ceiling'}/{k.removeprefix('mc_ref_')}": v
