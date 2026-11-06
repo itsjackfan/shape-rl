@@ -22,6 +22,52 @@ def group_relative(rewards_N, G: int, scale: str = "group"):
     return a_PG.flatten()
 
 
+def gae(r_n, V_nT, mask_nT, lam: float):
+    """Per-token advantage with gamma = 1: A_t = sum_k lam^k delta_{t+k}, delta_t = V_{t+1} - V_t on real tokens and
+    delta_last = r - V_last at the row's last real token (masks are right-padded). lam = 1 gives A_t = r - V_t. Padding -> 0."""
+    m = mask_nT.float()
+    rows, last = torch.arange(len(r_n)), (m.sum(1) - 1).clamp(min=0).long()
+    delta = (torch.cat([V_nT[:, 1:], V_nT[:, -1:]], 1) - V_nT) * m
+    delta[rows, last] = r_n - V_nT[rows, last]
+    if lam == 1.0:
+        return torch.flip(torch.cumsum(torch.flip(delta, [1]), 1), [1]) * m
+    A, run = torch.zeros_like(delta), torch.zeros_like(r_n)
+    for t in range(delta.shape[1] - 1, -1, -1):
+        run = delta[:, t] + lam * run
+        A[:, t] = run
+    return A * m
+
+
+def leader_labels(sim, tau: float):
+    """Greedy leader clustering: in item order, an unlabelled item becomes a leader and takes every unlabelled item with
+    similarity >= tau to it (itself included). -> label = the leader's index, for every item."""
+    lab = torch.full((len(sim),), -1, dtype=torch.long, device=sim.device)
+    for i in range(len(sim)):
+        if lab[i] < 0:
+            lab[(lab < 0) & (sim[i] >= tau)] = i
+            lab[i] = i
+    return lab
+
+
+def step_advantage(z_GSD, ok_GS, r_G, tau: float):
+    """Step advantages of one prompt group: cluster the valid step states (cosine >= tau to the leader), then
+    A_S = r - mean r over the cluster's members, or 0 for a cluster whose members all come from one trajectory.
+    -> (A_S_GS, number of clusters, number of clusters shared by >= 2 trajectories)."""
+    items = ok_GS.nonzero()  # (row in group, step)
+    A_S = torch.zeros(ok_GS.shape, device=r_G.device)
+    if len(items) == 0:
+        return A_S, 0, 0
+    zz = z_GSD[items[:, 0], items[:, 1]].float()
+    lab, r_items = leader_labels(zz @ zz.T, tau), r_G[items[:, 0]]
+    n_shared = 0
+    for c in lab.unique():
+        m = lab == c
+        if items[m, 0].unique().numel() > 1:
+            n_shared += 1
+            A_S[items[m, 0], items[m, 1]] = r_items[m] - r_items[m].mean()
+    return A_S, len(lab.unique()), n_shared
+
+
 def all_reduce_mean_(params):
     """Average gradients over processes so that every process keeps the same head."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -122,7 +168,7 @@ class HiddenValue(AdvantageEstimator):
         self.kind, self.hidden, self.train_mode, self.lam = kind, hidden, train, lam
         self.combine, self.omega, self.scale, self.lr, self.steps, self.K = combine, omega, scale, lr, steps, tokens
         self.gen = torch.Generator().manual_seed(seed)
-        self.opt = None
+        self.opt, self._pending_opt = None, None  # optimizer state of a requeue, loaded once the head's params exist (_setup)
 
     def _params(self):
         if self.train_mode == "readout":
@@ -145,7 +191,7 @@ class HiddenValue(AdvantageEstimator):
         self.head.to(h_bTD.device)
         if self.opt is None and self._params():
             self.opt = torch.optim.AdamW(self._params(), lr=self.lr, weight_decay=1e-2)
-            if getattr(self, "_pending_opt", None):
+            if self._pending_opt:
                 self.opt.load_state_dict(self._pending_opt)
 
     @torch.no_grad()
@@ -162,32 +208,16 @@ class HiddenValue(AdvantageEstimator):
         h_fit = torch.gather(h_bTD, 1, idx[..., None].expand(-1, -1, h_bTD.shape[-1]))
         return {"V": V_bT.float(), "mask": mask_bT, "h_fit": h_fit, "fit_ok": (n_tok > 0).expand(-1, self.K)}
 
-    def value_advantage(self, r_n, V_nT, mask_nT):
-        m = mask_nT.float()
-        last = (m.sum(1) - 1).clamp(min=0).long()
-        V_next = torch.cat([V_nT[:, 1:], V_nT[:, -1:]], 1)
-        delta = (V_next - V_nT) * m
-        delta[torch.arange(len(r_n)), last] = r_n - V_nT[torch.arange(len(r_n)), last]
-        if self.lam == 1.0:
-            A = torch.flip(torch.cumsum(torch.flip(delta, [1]), 1), [1])
-        else:
-            A, run = torch.zeros_like(delta), torch.zeros_like(r_n)
-            for t in range(delta.shape[1] - 1, -1, -1):
-                run = delta[:, t] + self.lam * run
-                A[:, t] = run
-        return A * m
-
     def forward(self, rewards_N, G, local, obs):
         r_n = rewards_N[local]
         ok_n = ~torch.isnan(r_n)
         r_n = torch.nan_to_num(r_n, nan=0.0)
         V, mask = obs["V"], obs["mask"]
-        A = self.value_advantage(r_n, V, mask)
+        A = gae(r_n, V, mask, self.lam)
         if self.combine == "add":
             A = torch.nan_to_num(group_relative(rewards_N, G, self.scale), nan=0.0)[local, None] + self.omega * A
         A = A * ok_n[:, None]
-        first = V[:, 0]
-        self.metrics = {"V0_mean": float(first.mean()), "abs_adv_mean": float((A.abs() * mask).sum() / mask.sum().clamp(min=1))}
+        self.metrics = {"V0_mean": float(V[:, 0].mean()), "abs_adv_mean": float((A.abs() * mask).sum() / mask.sum().clamp(min=1))}
         if self.opt is not None and self.training:
             self._fit(obs["h_fit"], obs["fit_ok"] & ok_n[:, None], r_n.clamp(0, 1))
         return A
@@ -196,7 +226,6 @@ class HiddenValue(AdvantageEstimator):
         """Online fit; gradients are averaged over processes (every process keeps the same head)."""
         x, y = h_nKD[ok_nK], y_n[:, None].expand_as(ok_nK)[ok_nK]
         (self.head.readout if self.train_mode == "readout" else self.head).train()  # a fixed projection keeps dropout off
-        n_par = sum(p.numel() for p in self._params())
         for _ in range(self.steps):
             self.opt.zero_grad()
             loss = F.binary_cross_entropy_with_logits(self.head(x), y) if len(x) else sum(p.sum() for p in self._params()) * 0
@@ -204,9 +233,9 @@ class HiddenValue(AdvantageEstimator):
             all_reduce_mean_(self._params())
             self.opt.step()
         self.head.eval()
-        self.flops += 6.0 * sum(p.numel() for p in self.head.parameters()) * len(x) * self.steps
-        self.metrics["fit_loss"] = float(loss.detach())
-        self.metrics["fit_params"] = n_par
+        n_fit = sum(p.numel() for p in self._params())
+        self.flops += (2.0 * sum(p.numel() for p in self.head.parameters()) + 4.0 * n_fit) * len(x) * self.steps  # fwd + bwd
+        self.metrics.update(fit_loss=float(loss.detach()), fit_params=n_fit)
 
     def extra_state(self):
         return {"head": None if self.head is None else self.head.state_dict(),
@@ -270,23 +299,9 @@ class HiddenCluster(AdvantageEstimator):
         A_S_NS = torch.zeros(ok_NS.shape, device=r_N.device)
         n_clusters, n_shared = 0, 0
         for g in range(len(r_N) // G):
-            rows = torch.arange(g * G, (g + 1) * G, device=r_N.device)
-            items = ok_NS[rows].nonzero()  # (row in group, step)
-            if len(items) == 0:
-                continue
-            zz = z_NSD[rows[items[:, 0]], items[:, 1]].float()
-            sim = zz @ zz.T
-            lab = torch.full((len(items),), -1, dtype=torch.long, device=zz.device)
-            for i in range(len(items)):
-                if lab[i] < 0:
-                    lab[(lab < 0) & (sim[i] >= self.tau)] = i
-            r_items = r_N[rows[items[:, 0]]]
-            for c in lab.unique():
-                m = lab == c
-                n_clusters += 1
-                if items[m, 0].unique().numel() > 1:
-                    n_shared += 1
-                    A_S_NS[rows[items[m, 0]], items[m, 1]] = r_items[m] - r_items[m].mean()
+            rows = slice(g * G, (g + 1) * G)
+            A_S_NS[rows], n_c, n_s = step_advantage(z_NSD[rows], ok_NS[rows], r_N[rows], self.tau)
+            n_clusters, n_shared = n_clusters + n_c, n_shared + n_s
         A_S = torch.gather(A_S_NS[local], 1, obs["step"])
         A_E = torch.nan_to_num(group_relative(rewards_N, G, self.scale), nan=0.0)[local]
         A = (A_E[:, None] + self.omega * A_S) * obs["mask"] * (~torch.isnan(rewards_N[local]))[:, None]
