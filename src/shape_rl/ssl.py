@@ -250,9 +250,16 @@ def metrics(p_NS, data, test):
     out["spearman_A_resid"] = float(np.corrcoef(ra, rm)[0, 1]) if A_pr[m].std() > 0 else float("nan")
     dq_mc, dq_pr = R[:, 2:] - R[:, 1:2], p[:, 2:] - p[:, 1:2]
     m = ~np.isnan(dq_mc) & (dq_mc != 0)
-    out["sign_acc"] = float(np.mean(np.where(dq_pr[m] == 0, 0.5, np.sign(dq_pr[m]) == np.sign(dq_mc[m]))))
+    hit = np.where(dq_pr == 0, 0.5, np.sign(dq_pr) == np.sign(dq_mc))
+    out["sign_acc"], out["n_sign_pairs"] = float(np.mean(hit[m])), int(m.sum())
+    for kind in ("entropy", "random"):  # by branch-point kind (H1 x H2)
+        k = (idx.kind.values == kind)[:, None]
+        out[f"sign_acc_{kind}"] = float(np.mean(hit[m & k]))
+        mk = ~np.isnan(A_mc) & k
+        out[f"spearman_A_{kind}"] = float(spearmanr(A_pr[mk], A_mc[mk])[0]) if A_pr[mk].std() > 0 else float("nan")
     m = fin > 0
     out["ece"] = ece(np.clip(p[m], 0, 1), R[m], fin[m])
+    out["n_test_prompts"] = int(idx.prompt_id.nunique())
     return out
 
 
