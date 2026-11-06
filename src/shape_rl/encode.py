@@ -78,7 +78,7 @@ def write_index(out):
     tmp.rename(out / "index.parquet")
 
 
-def claim(path, stale_s=1200):
+def claim(path, stale_s=300):
     """Exclusive claim on a chunk; a claim older than stale_s (a preempted job) is taken over."""
     try:
         os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
