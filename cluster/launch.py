@@ -32,8 +32,8 @@ def parse_queues(spec):
 
 
 def gres(gpu, gpus):
-    """--gpus 0 (CPU-only job) adds no gres; run.sbatch then sees SLURM_GPUS_ON_NODE unset."""
-    return [f"--gres=gpu:{gpu}:{gpus}"] if gpus else ["--cpus-per-task=16", "--mem=128G"]
+    """GPU job: gres + 16 CPUs and 160G per GPU. --gpus 0 (CPU-only): 16 CPUs, 128G; run.sbatch sees SLURM_GPUS_ON_NODE unset."""
+    return [f"--gres=gpu:{gpu}:{gpus}", "--cpus-per-gpu=16", "--mem-per-gpu=160G"] if gpus else ["--cpus-per-task=16", "--mem=128G"]
 
 
 def best_queue(gpus, rtx, time="2-00:00:00", qs=None, extra=()):

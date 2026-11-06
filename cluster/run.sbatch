@@ -3,8 +3,6 @@
 #SBATCH --requeue
 #SBATCH --open-mode=append
 #SBATCH --nodes=1
-#SBATCH --cpus-per-gpu=16
-#SBATCH --mem-per-gpu=160G
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 module load cuda/12.9.1-fasrc01 cudnn/9.10.2.21_cuda12-fasrc01 gcc/14.2.0-fasrc01
