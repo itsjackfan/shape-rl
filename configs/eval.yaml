@@ -13,3 +13,4 @@ eval:
   gen_kwargs: max_gen_toks=${model.max_new_tokens}  # one response cap for every generative task (lm-eval default: 256)
   batch_size: auto
   limit: null
+  delete_evaluated: true  # disk policy: after a checkpoint eval, delete the evaluated checkpoints except the newest complete one

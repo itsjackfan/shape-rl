@@ -68,3 +68,19 @@ def test_last_complete_checkpoint(tmp_path):
         if complete:
             (tmp_path / f"checkpoint-{step}" / STATE_FILE).touch()
     assert last_complete_checkpoint(tmp_path) == str(tmp_path / "checkpoint-10")
+
+
+def test_prune_checkpoints(tmp_path):
+    """Delete the evaluated checkpoints; keep the newest complete one (resume) and every checkpoint not yet evaluated."""
+    from shape_rl.evaluate import prune_checkpoints
+    from shape_rl.trainer import STATE_FILE
+
+    for step, complete, evaluated in ((5, True, True), (8, True, False), (10, True, True), (20, False, False)):
+        (tmp_path / f"checkpoint-{step}").mkdir()
+        if complete:
+            (tmp_path / f"checkpoint-{step}" / STATE_FILE).touch()
+        if evaluated:
+            (tmp_path / "eval" / f"checkpoint-{step}").mkdir(parents=True)
+            (tmp_path / "eval" / f"checkpoint-{step}" / "results.json").touch()
+    prune_checkpoints(tmp_path)
+    assert sorted(d.name for d in tmp_path.glob("checkpoint-*")) == ["checkpoint-10", "checkpoint-20", "checkpoint-8"]

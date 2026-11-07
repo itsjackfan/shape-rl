@@ -50,6 +50,8 @@ scripts/tmp_<exp>/    one-off scripts; delete once results are documented (ask f
    One job per launch; each ablation needs its own log line, dir and run.
 4. Run guard: train/eval refuse to start unless `EXPERIMENT_LOG.md` has `- YYYY-MM-DD HH:MM EST — <abl>: <what it tests>` under `## <exp>`. The user writes it.
 5. Outputs: `$SHAPE_RL_OUTPUT_ROOT/<exp>/<ablation>/` (default `outputs/`), never overwritten. WandB run `<exp>/<ablation>`, group `<exp>`; evals log `test/*` into a second run `<exp>/<ablation>/eval` (same group) against `test/flops` (and `test/step`). Compute matching = equal `progress/flops` (training process only: generation, scoring and training passes, estimator; dataset building excluded); use `budget.max_flops` / `budget.save_every_flops`.
+   Disk (about 60 GB per 4B checkpoint): evaluate each checkpoint. A checkpoint eval then deletes every evaluated checkpoint
+   except the newest complete one, which a requeue needs (`eval.delete_evaluated`; set false to keep them).
 6. Smoke/failed/test runs not needed for a writeup: once the user has processed results, remind them to delete; delete on approval.
 7. Done: success -> merge to main. Failure -> keep branch, push; the user adds an entry in main's log (branch, code changes, why it failed).
 
